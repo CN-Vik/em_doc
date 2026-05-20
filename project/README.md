@@ -1,2 +1,1 @@
-# em_doc
-Summary of embedded software development materials
+# 项目知识介绍
