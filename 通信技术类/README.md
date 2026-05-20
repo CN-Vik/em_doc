@@ -1,1 +1,2 @@
-# 以太网，WIFI，蓝牙，SPI，UART，I2C，CAN，SDIO等等都属于通信的技术知识
+# 以太网，WIFI，蓝牙等等都属于通信的技术知识
+> 虽然I2C,UART,SPI,CAN也属于此文件夹，但是和MCU/SOC芯片强相关的，遂不在此介绍，在MCU文件夹内介绍
