@@ -1,0 +1,5 @@
+# LCD知识介绍
+## SPI LCD
+## RGB LCD
+## SPI+RGB LCD
+## MIPI DSI LCD
