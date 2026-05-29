@@ -1870,3 +1870,653 @@ make kernel
 ```
 
 一句话总结：**先彻底回退，重建正确的 X2600 `.config`，然后只做三类最小改动：build defconfig 打开 SPI0，kernel config 打开 IIO/BMI160_SPI/INGENIC_SPI，DTS 在 SPI0 下挂 `bosch,bmi160` 节点。**
+
+
+-------
+---------
+--------
+你这个输出先别慌，**你这次 grep 没搜到关键内容，不代表项目没有设备注册方式**。主要问题是你搜得太宽了，结果被这些无关目录抢占了：
+
+```text
+kernel/kernel/scripts/
+kernel/kernel/arch/arm64/
+kernel/kernel/arch/arm/
+kernel/kernel/scripts/dtc/include-prefixes/
+```
+
+你现在是 X2600，MIPS 平台，所以应该重点搜：
+
+```text
+kernel/kernel/arch/mips/
+kernel/kernel/drivers/
+module_driver/
+```
+
+你这份输出里大部分都是 kernel 自带脚本和别的平台 DTS，不是你板子的代码。
+
+---
+
+# 先讲核心结论
+
+你要加 **IIO + SPI + BMI160 IMU**，一般不是重新写一个完整 BMI160 驱动。
+
+Linux 里已经有：
+
+```bash
+kernel/kernel/drivers/iio/imu/bmi160/
+```
+
+你真正要做的是两件事：
+
+```text
+1. 让 BMI160_SPI 驱动被编译进去
+2. 让系统知道 SPI 总线上挂了一个 BMI160 设备
+```
+
+第 1 件事是 kernel Kconfig/defconfig。
+
+第 2 件事有两种方式：
+
+```text
+方式 A：标准 DTS 方式
+在设备树里添加 bmi160 节点。
+
+方式 B：君正 module_driver / 板级注册方式
+写一个小模块，用 spi_new_device / spi_register_device 注册一个 SPI 设备。
+```
+
+你现在问的 **“君正 module_driver 注册设备咋操作”**，本质就是方式 B。
+
+---
+
+# 一、先确认 BMI160 SPI 驱动匹配名
+
+你不能乱写 `modalias`。SPI 设备注册时的名字必须和 BMI160 SPI 驱动里的 `spi_device_id` 对上。
+
+先执行：
+
+```bash
+cd ~/project/x2600/kernel/kernel
+
+grep -n "spi_device_id\|bmi160_spi_id\|of_device_id\|compatible" \
+drivers/iio/imu/bmi160/bmi160_spi.c -A30
+```
+
+你大概率会看到类似：
+
+```c
+static const struct spi_device_id bmi160_spi_id[] = {
+    { "bmi160", 0 },
+    { }
+};
+```
+
+如果是这样，后面注册 SPI 设备的时候就应该写：
+
+```c
+.modalias = "bmi160",
+```
+
+不是随便写 `"bmi160_spi"`。
+
+---
+
+# 二、先用更准确的 grep 找 X2600 自己的设备注册方式
+
+你之前这个命令太宽：
+
+```bash
+grep -R "i2c_board_info\|i2c_register_board_info\|of_device_id\|compatible.*bmi\|spi_register_device\|spi_board_info" \
+kernel/kernel module_driver -n | head -100
+```
+
+建议换成这组：
+
+```bash
+cd ~/project/x2600
+
+echo "===== 1. 搜君正/MIPS相关DTS ====="
+find kernel/kernel/arch/mips module_driver -name "*.dts" -o -name "*.dtsi" | head -100
+
+echo
+echo "===== 2. 搜X2600/X2000/XBurst相关DTS内容 ====="
+grep -R "x2600\|x2000\|ingenic\|jz\|ssi\|spi\|i2c" \
+kernel/kernel/arch/mips module_driver -n \
+--include="*.dts" --include="*.dtsi" | head -100
+
+echo
+echo "===== 3. 搜SPI设备注册代码，排除无关scripts ====="
+grep -R "spi_board_info\|spi_new_device\|spi_register_device\|spi_busnum_to_master" \
+kernel/kernel/arch/mips kernel/kernel/drivers module_driver -n \
+--exclude-dir=scripts \
+--exclude-dir=.git \
+--exclude-dir=Documentation | head -100
+
+echo
+echo "===== 4. 搜I2C设备注册代码 ====="
+grep -R "i2c_board_info\|i2c_register_board_info\|i2c_new_device\|i2c_new_client_device" \
+kernel/kernel/arch/mips kernel/kernel/drivers module_driver -n \
+--exclude-dir=scripts \
+--exclude-dir=.git \
+--exclude-dir=Documentation | head -100
+```
+
+重点看第 3 个命令有没有搜到君正自己的示例。
+
+如果还是没有，那你就直接按君正 SPI 文档的方式写一个“注册 BMI160 SPI 设备的小模块”。你之前上传的君正 SPI 文档里，官方就是用 `spi_register_device()` / `spi_register_driver()` 这种板级注册方式做 SPI 设备添加示例的。
+
+---
+
+# 三、BMI160 不建议自己再写 `spi_driver`
+
+官方文档里的示例是这样：
+
+```text
+自己写 spi_driver
+自己写 spi_board_info
+自己注册 spi_device
+```
+
+但是你这里不一样。
+
+因为 BMI160 已经有现成驱动：
+
+```bash
+drivers/iio/imu/bmi160/bmi160_spi.c
+drivers/iio/imu/bmi160/bmi160_core.c
+```
+
+所以你不要重复写：
+
+```c
+static struct spi_driver xxx_driver = { ... };
+```
+
+你只需要注册一个 SPI 设备，让它匹配到已有的 `bmi160_spi_driver`。
+
+也就是：
+
+```text
+你写的小模块：负责创建 SPI device
+Linux 自带 BMI160 SPI 驱动：负责 probe、读写寄存器、注册 IIO 设备
+```
+
+关系是这样：
+
+```text
+bmi160_spi_board.ko
+    |
+    | spi_new_device()
+    v
+创建一个 SPI device：modalias = "bmi160"
+    |
+    | SPI core 自动匹配
+    v
+drivers/iio/imu/bmi160/bmi160_spi.c
+    |
+    | probe()
+    v
+注册 IIO 设备
+/sys/bus/iio/devices/iio:deviceX/
+```
+
+---
+
+# 四、写一个 BMI160 SPI 设备注册模块
+
+可以先建一个简单测试模块，比如：
+
+```bash
+cd ~/project/x2600/module_driver
+mkdir -p bmi160_spi_board
+cd bmi160_spi_board
+```
+
+创建文件：
+
+```bash
+vim bmi160_spi_board.c
+```
+
+内容如下，注意里面的 SPI 总线号、CS 引脚你要按你的硬件改：
+
+```c
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/spi/spi.h>
+#include <linux/errno.h>
+#include <soc/gpio.h>
+
+/*
+ * 这个模块只负责“声明板子上有一个 BMI160 SPI 设备”。
+ * 真正的 BMI160 驱动在 kernel/kernel/drivers/iio/imu/bmi160/bmi160_spi.c
+ */
+
+/*
+ * TODO: 改成你的实际 SPI 总线号。
+ * 例如 SPI0 就是 0，SPI1 就是 1。
+ */
+static int spi_bus_num = 0;
+
+/*
+ * 保存 spi_new_device() 创建出来的设备指针，
+ * 模块卸载时要用 spi_unregister_device() 注销。
+ */
+static struct spi_device *bmi160_spi_dev;
+
+/*
+ * SPI 设备板级信息。
+ *
+ * modalias 必须和 bmi160_spi.c 里的 spi_device_id 匹配。
+ * 你要先 grep 确认：
+ * grep -n "spi_device_id" drivers/iio/imu/bmi160/bmi160_spi.c -A20
+ *
+ * 如果里面是 { "bmi160", 0 }，这里就写 "bmi160"。
+ */
+static struct spi_board_info bmi160_spi_board_info = {
+    .modalias = "bmi160",
+
+    /*
+     * BMI160 SPI 最高频率先不要设置太高。
+     * 调通阶段建议 1MHz 或 2MHz。
+     */
+    .max_speed_hz = 1 * 1000 * 1000,
+
+    /*
+     * BMI160 常见 SPI mode 是 MODE_0。
+     * 如果你板级原理图或者芯片手册要求别的模式，再改。
+     */
+    .mode = SPI_MODE_0,
+
+    /*
+     * 同一条 SPI 总线上的片选编号。
+     * 如果只有一个设备，一般用 0。
+     */
+    .chip_select = 0,
+
+    /*
+     * 君正文档里用 controller_data 指定片选 GPIO。
+     * 这里 GPIO_PC(16) 只是例子。
+     *
+     * 你必须改成 BMI160 实际 CS 引脚。
+     * 例如 PC16、PC09 之类。
+     */
+    .controller_data = (void *)GPIO_PC(16),
+};
+
+static int __init bmi160_spi_board_init(void)
+{
+    struct spi_master *master;
+
+    pr_info("bmi160_spi_board: init, bus=%d\n", spi_bus_num);
+
+    /*
+     * 1. 根据总线号获取 SPI master。
+     * 如果这里失败，说明 SPI 控制器没有注册成功，
+     * 要回去检查 IConfigTool 是否打开 SPI 控制器、pinmux 是否正确。
+     */
+    master = spi_busnum_to_master(spi_bus_num);
+    if (!master) {
+        pr_err("bmi160_spi_board: failed to get spi master %d\n", spi_bus_num);
+        return -ENODEV;
+    }
+
+    /*
+     * 2. 设置 bus_num。
+     */
+    bmi160_spi_board_info.bus_num = spi_bus_num;
+
+    /*
+     * 3. 创建 SPI 设备。
+     * 创建成功后，SPI core 会尝试匹配 modalias = "bmi160" 的驱动。
+     */
+    bmi160_spi_dev = spi_new_device(master, &bmi160_spi_board_info);
+
+    /*
+     * 4. 释放 master 引用。
+     */
+    spi_master_put(master);
+
+    if (!bmi160_spi_dev) {
+        pr_err("bmi160_spi_board: spi_new_device failed\n");
+        return -ENODEV;
+    }
+
+    pr_info("bmi160_spi_board: registered bmi160 on spi%d.%d\n",
+            spi_bus_num, bmi160_spi_board_info.chip_select);
+
+    return 0;
+}
+
+static void __exit bmi160_spi_board_exit(void)
+{
+    pr_info("bmi160_spi_board: exit\n");
+
+    if (bmi160_spi_dev) {
+        spi_unregister_device(bmi160_spi_dev);
+        bmi160_spi_dev = NULL;
+    }
+}
+
+module_init(bmi160_spi_board_init);
+module_exit(bmi160_spi_board_exit);
+
+MODULE_DESCRIPTION("BMI160 SPI board device registration for Ingenic X2600");
+MODULE_AUTHOR("Vik");
+MODULE_LICENSE("GPL");
+```
+
+---
+
+# 五、这个模块和 BMI160 驱动的关系
+
+你需要让这几个模块/配置同时存在：
+
+```text
+1. SPI master 驱动
+   让 /sys/bus/spi/devices/ 里面能出现 SPI 控制器
+
+2. BMI160 SPI 驱动
+   drivers/iio/imu/bmi160/bmi160_spi.c
+
+3. 你这个 bmi160_spi_board 小模块
+   负责创建 spi0.0 这个设备
+```
+
+如果 BMI160 SPI 是编成模块，那么加载顺序可以是：
+
+```bash
+insmod bmi160_core.ko
+insmod bmi160_spi.ko
+insmod bmi160_spi_board.ko
+```
+
+也可以先注册 board，再加载 driver。SPI core 后面也会匹配。
+
+---
+
+# 六、先别急着集成 module_driver，先单独编译测试
+
+最稳的方式是先把这个小模块当普通 kernel module 编译出来，推到板子上验证。
+
+创建 `Makefile`：
+
+```makefile
+obj-m += bmi160_spi_board.o
+
+KERNEL_DIR ?= /home/vik/project/x2600/kernel/kernel
+CROSS_COMPILE ?= /home/vik/project/x2600/build/../buildroot/buildroot24/output/host/usr/bin/mips-linux-gnu-
+
+all:
+	$(MAKE) -C $(KERNEL_DIR) M=$(PWD) ARCH=mips CROSS_COMPILE=$(CROSS_COMPILE) modules
+
+clean:
+	$(MAKE) -C $(KERNEL_DIR) M=$(PWD) ARCH=mips CROSS_COMPILE=$(CROSS_COMPILE) clean
+```
+
+然后：
+
+```bash
+cd ~/project/x2600/module_driver/bmi160_spi_board
+
+make
+```
+
+看是否生成：
+
+```bash
+ls -l *.ko
+```
+
+---
+
+# 七、上板测试
+
+假设生成了：
+
+```bash
+bmi160_spi_board.ko
+```
+
+推到板子：
+
+```bash
+adb push bmi160_spi_board.ko /tmp/
+```
+
+如果 BMI160 驱动是模块，也推上去：
+
+```bash
+cd ~/project/x2600/kernel/kernel
+
+find . -name "*bmi160*.ko"
+```
+
+比如：
+
+```bash
+adb push drivers/iio/imu/bmi160/bmi160_core.ko /tmp/
+adb push drivers/iio/imu/bmi160/bmi160_spi.ko /tmp/
+```
+
+板子上：
+
+```bash
+cd /tmp
+
+insmod bmi160_core.ko
+insmod bmi160_spi.ko
+insmod bmi160_spi_board.ko
+
+dmesg | grep -i "bmi160\|spi\|iio"
+```
+
+然后看 IIO：
+
+```bash
+ls /sys/bus/iio/devices/
+
+for f in /sys/bus/iio/devices/iio:device*/name; do
+    echo "$f"
+    cat "$f"
+done
+```
+
+如果成功，应该能看到类似：
+
+```text
+bmi160
+```
+
+然后读数据：
+
+```bash
+cd /sys/bus/iio/devices/iio:device0
+
+cat name
+cat in_accel_x_raw
+cat in_accel_y_raw
+cat in_accel_z_raw
+cat in_anglvel_x_raw
+cat in_anglvel_y_raw
+cat in_anglvel_z_raw
+```
+
+---
+
+# 八、如果你想集成进君正 module_driver 工程
+
+等单独 `.ko` 验证成功后，再集成进君正 `module_driver`。
+
+因为我现在还没看到你 `module_driver` 目录结构，所以不能乱编具体路径。你先执行：
+
+```bash
+cd ~/project/x2600
+
+echo "===== module_driver 目录结构 ====="
+find module_driver -maxdepth 3 -type f | head -100
+
+echo
+echo "===== module_driver 里的 Makefile/mk ====="
+find module_driver -maxdepth 4 \( -name "Makefile" -o -name "*.mk" -o -name "Kconfig" -o -name "Config.in" \) -print
+
+echo
+echo "===== 搜 MD_ 配置 ====="
+grep -R "MD_.*=" build module_driver package -n \
+--include="*.mk" --include="Config.in" --include="Kconfig" --include="*_defconfig" | head -100
+```
+
+你需要找一个已经存在的小模块，比如 gpio key、rtc、sensor、spidev 之类，模仿它的目录结构。
+
+君正这类工程通常是：
+
+```text
+module_driver/xxx/
+    xxx.c
+    Makefile
+    Config.in 或 Kconfig
+
+build/configs/x2600n_tiger_nor_5.10_defconfig
+    MD_XXX=y
+
+package/default_driver_init_order.mk
+    控制加载顺序
+
+package/S11module_driver_default
+    控制开机 insmod 顺序
+```
+
+你这个 build 总配置里已经有：
+
+```bash
+APP_module_driver=y
+MD_INIT_ORDER_FILE=package/default_driver_init_order.mk
+MD_INIT_START_FILE=package/S11module_driver_default
+```
+
+说明它确实有一个“模块化驱动自动编译/自动加载”的框架。
+
+---
+
+# 九、为什么你不能只打开 BMI160 驱动？
+
+因为只打开：
+
+```text
+CONFIG_BMI160_SPI=y
+```
+
+只是让驱动存在。
+
+但是 Linux 还不知道板子上有这个硬件。
+
+必须再有一个东西创建这个设备：
+
+```text
+DTS 方式：
+bmi160@0 {
+    compatible = "bosch,bmi160";
+    reg = <0>;
+};
+
+或者 module_driver 方式：
+spi_new_device(master, &bmi160_spi_board_info);
+```
+
+否则 `bmi160_spi_probe()` 不会执行。
+
+---
+
+# 十、SPI BMI160 的几个坑
+
+## 1. CS 引脚一定要对
+
+这个地方你必须改：
+
+```c
+.controller_data = (void *)GPIO_PC(16),
+```
+
+`GPIO_PC(16)` 只是我按君正文档风格写的例子。官方 SPI 文档里也是通过 `controller_data` 指定片选 GPIO。
+
+你要根据原理图确认 BMI160 的 CS 接到了哪个 GPIO。
+
+---
+
+## 2. SPI mode 可能要改
+
+先用：
+
+```c
+.mode = SPI_MODE_0,
+```
+
+如果读不到 ID，再试：
+
+```c
+.mode = SPI_MODE_3,
+```
+
+官方 SPI 示例里用了 `SPI_MODE_3`，但 BMI160 通常常见用法可能是 MODE_0，最终以你的硬件和驱动实际通信为准。
+
+---
+
+## 3. 频率先低后高
+
+调试阶段不要直接 10MHz。
+
+建议先：
+
+```c
+.max_speed_hz = 1 * 1000 * 1000,
+```
+
+稳定后再提高。
+
+---
+
+## 4. 要确认 SPI 控制器已经出来
+
+板子上看：
+
+```bash
+ls /sys/bus/spi/devices/
+ls /sys/class/spi_master/
+dmesg | grep -i spi
+```
+
+如果连 SPI master 都没有，那说明 IConfigTool / pinmux / SPI 控制器没有配好。
+
+---
+
+# 十一、你现在按这个最短路径做
+
+先别纠结完整集成，先跑通：
+
+```text
+1. IConfigTool 打开 SPI 控制器和引脚
+2. kernel defconfig 打开：
+   CONFIG_SPI
+   CONFIG_IIO
+   CONFIG_BMI160
+   CONFIG_BMI160_SPI
+   CONFIG_REGMAP_SPI
+
+3. 单独写 bmi160_spi_board.ko
+4. 推到板子 insmod
+5. 看 dmesg 是否 probe
+6. 看 /sys/bus/iio/devices 是否出现 bmi160
+```
+
+等这个跑通了，再集成进 `module_driver` 自动加载体系。
+
+你现在最该做的下一步是执行：
+
+```bash
+cd ~/project/x2600/kernel/kernel
+
+grep -n "spi_device_id\|bmi160_spi_id\|of_device_id\|compatible" \
+drivers/iio/imu/bmi160/bmi160_spi.c -A30
+```
+
+确认 `modalias` 到底应该写 `"bmi160"` 还是别的。然后再根据你的原理图，把 `spi_bus_num`、`GPIO_PC(16)`、`chip_select` 改成真实值。
