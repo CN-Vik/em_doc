@@ -926,6 +926,509 @@ SVPWM 会合理安排这 8 个开关状态：
 
 所以 SPWM、SVPWM、FOC 这些算法，本质上都是在努力让电机电流更接近正弦，减少不想要的谐波。
 
+-----
+----
+----
+# SVPWM谐波时间计算
+SVPWM 的作用时间，本质就是算：
+
+```text
+在一个 PWM 周期 Ts 里面：
+第一个有效矢量作用多久 T1
+第二个有效矢量作用多久 T2
+零矢量作用多久 T0
+```
+
+核心公式就是这个：
+
+\begin{aligned}
+T_1 &= T_s \frac{\sqrt{3},|U_{ref}|}{V_{dc}}\sin\left(60^\circ-\theta\right)\
+T_2 &= T_s \frac{\sqrt{3},|U_{ref}|}{V_{dc}}\sin\theta\
+T_0 &= T_s - T_1 - T_2
+\end{aligned}
+
+这里一定要注意：
+
+```text
+θ 是当前扇区内部角度，不是完整电角度。
+```
+
+比如目标矢量角度是 75°，它在第 II 扇区，扇区 II 范围是 60°~120°，所以：
+
+```text
+θ = 75° - 60° = 15°
+```
+
+---
+
+## 1. SVPWM 作用时间是怎么来的？
+
+假设目标电压矢量 `Uref` 在第 I 扇区：
+
+```text
+第 I 扇区：U0(100) 和 U60(110) 之间
+```
+
+那就用这两个相邻矢量合成它：
+
+```text
+Uref ≈ U0 * T1/Ts + U60 * T2/Ts + Uz * T0/Ts
+```
+
+因为零矢量 `Uz` 是 `000` 或 `111`，它不产生有效电压，所以主要就是：
+
+```text
+Uref ≈ U0 * T1/Ts + U60 * T2/Ts
+```
+
+也就是说：
+
+```text
+T1 越大，目标矢量越靠近 U0(100)
+T2 越大，目标矢量越靠近 U60(110)
+T0 是剩下的时间，用零矢量填满整个 PWM 周期
+```
+
+---
+
+## 2. 先确定目标矢量在哪个扇区
+
+FOC 反 Park 之后一般会得到：
+
+```text
+Ualpha
+Ubeta
+```
+
+目标矢量幅值：
+
+```c
+Uref = sqrtf(Ualpha * Ualpha + Ubeta * Ubeta);
+```
+
+目标矢量角度：
+
+```c
+angle = atan2f(Ubeta, Ualpha);
+```
+
+如果角度小于 0，就加一圈：
+
+```c
+if (angle < 0.0f)
+{
+    angle += 2.0f * PI;
+}
+```
+
+然后判断扇区：
+
+```c
+sector = (int)(angle / (PI / 3.0f)) + 1;
+```
+
+因为每个扇区是 60°，也就是 `π/3`。
+
+扇区内部角度：
+
+```c
+theta = angle - (sector - 1) * PI / 3.0f;
+```
+
+---
+
+## 3. 六个扇区对应关系
+
+```text
+第 I 扇区：   0° ~  60°，用 100 和 110
+第 II 扇区： 60° ~ 120°，用 110 和 010
+第 III 扇区：120° ~ 180°，用 010 和 011
+第 IV 扇区：180° ~ 240°，用 011 和 001
+第 V 扇区： 240° ~ 300°，用 001 和 101
+第 VI 扇区：300° ~ 360°，用 101 和 100
+```
+
+在任意一个扇区里面，都是：
+
+```text
+用当前扇区的两个相邻有效矢量 + 零矢量
+```
+
+---
+
+## 4. T1、T2、T0 公式
+
+假设：
+
+```text
+Ts = PWM 周期
+Vdc = 母线电压
+Uref = 目标电压矢量幅值
+theta = 当前扇区内部角度，范围 0°~60°
+```
+
+那么：
+
+```c
+T1 = Ts * sqrt(3) * Uref / Vdc * sin(PI / 3 - theta);
+T2 = Ts * sqrt(3) * Uref / Vdc * sin(theta);
+T0 = Ts - T1 - T2;
+```
+
+也可以先定义调制度：
+
+```c
+m = sqrt(3) * Uref / Vdc;
+```
+
+那就是：
+
+```c
+T1 = Ts * m * sin(PI / 3 - theta);
+T2 = Ts * m * sin(theta);
+T0 = Ts - T1 - T2;
+```
+
+在线性 SVPWM 里面，一般要求：
+
+```text
+m <= 1
+```
+
+也就是：
+
+```text
+Uref <= Vdc / √3
+```
+
+否则 `T0` 可能变成负数，说明已经进入过调制区了。
+
+---
+
+## 5. T1、T2、T0 算出来之后怎么变成三相占空比？
+
+注意，`T1/T2/T0` 不是直接写进 `TIM1->CCR1/2/3` 的。
+
+你还要把它转换成 A/B/C 三相上管的导通时间：
+
+```text
+Ta = A 相上管导通总时间
+Tb = B 相上管导通总时间
+Tc = C 相上管导通总时间
+```
+
+然后：
+
+```c
+duty_a = Ta / Ts;
+duty_b = Tb / Ts;
+duty_c = Tc / Ts;
+```
+
+最后写定时器：
+
+```c
+TIM1->CCR1 = duty_a * PWM_PERIOD;
+TIM1->CCR2 = duty_b * PWM_PERIOD;
+TIM1->CCR3 = duty_c * PWM_PERIOD;
+```
+
+---
+
+## 6. 六个扇区的 Ta/Tb/Tc 表
+
+这个表很重要，写代码经常直接用它。
+
+| 扇区  | Ta               | Tb               | Tc               |
+| --- | ---------------- | ---------------- | ---------------- |
+| I   | `T1 + T2 + T0/2` | `T2 + T0/2`      | `T0/2`           |
+| II  | `T1 + T0/2`      | `T1 + T2 + T0/2` | `T0/2`           |
+| III | `T0/2`           | `T1 + T2 + T0/2` | `T2 + T0/2`      |
+| IV  | `T0/2`           | `T1 + T0/2`      | `T1 + T2 + T0/2` |
+| V   | `T2 + T0/2`      | `T0/2`           | `T1 + T2 + T0/2` |
+| VI  | `T1 + T2 + T0/2` | `T0/2`           | `T1 + T0/2`      |
+
+这个表对应的是常见的七段式 SVPWM，对称分配零矢量。
+
+---
+
+## 7. 以第 I 扇区举例
+
+第 I 扇区开关顺序是：
+
+```text
+000 → 100 → 110 → 111 → 110 → 100 → 000
+```
+
+对应三相上管状态：
+
+```text
+状态:     000   100   110   111   110   100   000
+A上管:     0     1     1     1     1     1     0
+B上管:     0     0     1     1     1     0     0
+C上管:     0     0     0     1     0     0     0
+```
+
+所以在第 I 扇区：
+
+```text
+A 相上管导通时间最长
+B 相上管导通时间中等
+C 相上管导通时间最短
+```
+
+也就是：
+
+```text
+Ta > Tb > Tc
+```
+
+用公式就是：
+
+```c
+Ta = T1 + T2 + T0 / 2;
+Tb = T2 + T0 / 2;
+Tc = T0 / 2;
+```
+
+---
+
+## 8. 数字例子
+
+假设：
+
+```text
+Vdc = 24V
+Uref = 6V
+PWM频率 = 20kHz
+Ts = 50us
+目标矢量在第 I 扇区，theta = 20°
+```
+
+先算调制度：
+
+```text
+m = √3 * Uref / Vdc
+  = 1.732 * 6 / 24
+  ≈ 0.433
+```
+
+然后：
+
+```text
+T1 = 50us * 0.433 * sin(40°)
+   ≈ 13.9us
+
+T2 = 50us * 0.433 * sin(20°)
+   ≈ 7.4us
+
+T0 = 50us - 13.9us - 7.4us
+   ≈ 28.7us
+```
+
+第 I 扇区：
+
+```text
+Ta = T1 + T2 + T0/2
+   = 13.9 + 7.4 + 14.35
+   = 35.65us
+
+Tb = T2 + T0/2
+   = 7.4 + 14.35
+   = 21.75us
+
+Tc = T0/2
+   = 14.35us
+```
+
+所以占空比：
+
+```text
+Da = 35.65 / 50 = 71.3%
+Db = 21.75 / 50 = 43.5%
+Dc = 14.35 / 50 = 28.7%
+```
+
+这时候你写入 STM32 TIM1：
+
+```c
+CCR1 = PWM_PERIOD * 0.713f;
+CCR2 = PWM_PERIOD * 0.435f;
+CCR3 = PWM_PERIOD * 0.287f;
+```
+
+---
+
+## 9. STM32 HAL 代码框架
+
+```c
+#include <math.h>
+#include <stdint.h>
+
+#define PI      3.14159265358979323846f
+#define SQRT3   1.7320508075688772f
+
+typedef struct
+{
+    float duty_a;
+    float duty_b;
+    float duty_c;
+    int sector;
+} svpwm_out_t;
+
+static float clampf(float x, float min, float max)
+{
+    if (x < min) return min;
+    if (x > max) return max;
+    return x;
+}
+
+svpwm_out_t SVPWM_Calc_Time(float Ualpha, float Ubeta, float Vdc)
+{
+    svpwm_out_t out;
+
+    float Uref;
+    float angle;
+    float theta;
+    float m;
+
+    float T1;
+    float T2;
+    float T0;
+
+    float Ta;
+    float Tb;
+    float Tc;
+
+    /*
+     * 这里为了简单，令 Ts = 1
+     * 所以 T1/T2/T0 都是归一化时间
+     * 最后 Ta/Tb/Tc 直接就是占空比
+     */
+    const float Ts = 1.0f;
+
+    Uref = sqrtf(Ualpha * Ualpha + Ubeta * Ubeta);
+
+    angle = atan2f(Ubeta, Ualpha);
+    if (angle < 0.0f)
+    {
+        angle += 2.0f * PI;
+    }
+
+    out.sector = (int)(angle / (PI / 3.0f)) + 1;
+
+    if (out.sector > 6)
+    {
+        out.sector = 6;
+    }
+
+    theta = angle - (out.sector - 1) * (PI / 3.0f);
+
+    /*
+     * 调制度
+     * 线性 SVPWM 一般 m <= 1
+     */
+    m = SQRT3 * Uref / Vdc;
+    m = clampf(m, 0.0f, 1.0f);
+
+    T1 = Ts * m * sinf(PI / 3.0f - theta);
+    T2 = Ts * m * sinf(theta);
+    T0 = Ts - T1 - T2;
+
+    if (T0 < 0.0f)
+    {
+        T0 = 0.0f;
+    }
+
+    switch (out.sector)
+    {
+        case 1:
+            Ta = T1 + T2 + T0 * 0.5f;
+            Tb = T2 + T0 * 0.5f;
+            Tc = T0 * 0.5f;
+            break;
+
+        case 2:
+            Ta = T1 + T0 * 0.5f;
+            Tb = T1 + T2 + T0 * 0.5f;
+            Tc = T0 * 0.5f;
+            break;
+
+        case 3:
+            Ta = T0 * 0.5f;
+            Tb = T1 + T2 + T0 * 0.5f;
+            Tc = T2 + T0 * 0.5f;
+            break;
+
+        case 4:
+            Ta = T0 * 0.5f;
+            Tb = T1 + T0 * 0.5f;
+            Tc = T1 + T2 + T0 * 0.5f;
+            break;
+
+        case 5:
+            Ta = T2 + T0 * 0.5f;
+            Tb = T0 * 0.5f;
+            Tc = T1 + T2 + T0 * 0.5f;
+            break;
+
+        case 6:
+        default:
+            Ta = T1 + T2 + T0 * 0.5f;
+            Tb = T0 * 0.5f;
+            Tc = T1 + T0 * 0.5f;
+            break;
+    }
+
+    out.duty_a = clampf(Ta, 0.0f, 1.0f);
+    out.duty_b = clampf(Tb, 0.0f, 1.0f);
+    out.duty_c = clampf(Tc, 0.0f, 1.0f);
+
+    return out;
+}
+```
+
+然后更新 TIM1：
+
+```c
+void SVPWM_Update_TIM1(float Ualpha, float Ubeta, float Vdc)
+{
+    svpwm_out_t svpwm;
+
+    uint32_t ccr1;
+    uint32_t ccr2;
+    uint32_t ccr3;
+
+    svpwm = SVPWM_Calc_Time(Ualpha, Ubeta, Vdc);
+
+    ccr1 = (uint32_t)(svpwm.duty_a * htim1.Init.Period);
+    ccr2 = (uint32_t)(svpwm.duty_b * htim1.Init.Period);
+    ccr3 = (uint32_t)(svpwm.duty_c * htim1.Init.Period);
+
+    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, ccr1);
+    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, ccr2);
+    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, ccr3);
+}
+```
+
+---
+
+## 10. 你现在抓住这个核心就行
+
+SVPWM 作用时间计算分 4 步：
+
+```text
+1. 根据 Ualpha/Ubeta 算 Uref 和 angle
+2. 根据 angle 判断当前在哪个 60° 扇区
+3. 用扇区内部角 theta 算 T1、T2、T0
+4. 根据扇区表，把 T1/T2/T0 转成 Ta/Tb/Tc，再写 CCR
+```
+
+一句话总结：
+
+**SVPWM 作用时间就是用三角函数算出相邻两个有效矢量在一个 PWM 周期内分别输出多久，剩余时间给零矢量。T1/T2/T0 算完后，再根据扇区转换成 A/B/C 三相 PWM 占空比。**
+
+
 ----
 ----
 ----
@@ -2521,3 +3024,8 @@ TIM1->CCR3 = ccr_c;
 ```
 
 如果你的驱动芯片需要 MCU 直接给 6 路 MOS 控制信号，那最好必须用 STM32 的 TIM1/TIM8 互补输出。对于 SVPWM/FOC，新手建议直接走 **TIM1/TIM8 + 6PWM + 死区 + Break保护** 这条路线。
+
+
+---------
+---------
+-------
