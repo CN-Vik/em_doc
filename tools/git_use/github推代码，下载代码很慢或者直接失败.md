@@ -686,3 +686,176 @@ $env:https_proxy="http://127.0.0.1:7897"
 **GitHub SSH 推拉：靠 `~/.ssh/config`。**
 **GitHub HTTPS 仓库：靠 `git config http.https://github.com.proxy`。**
 **ESP-IDF 工具下载：靠 PowerShell 环境变量 `HTTP_PROXY/HTTPS_PROXY`。**
+
+
+你这个不是代理不行，是**你现在用的是 CMD，不是 PowerShell**。
+
+你现在提示符是：
+
+```cmd
+C:\Users\ufo28>
+```
+
+这是 **cmd.exe**。
+
+而我前面给你的：
+
+```powershell
+$env:HTTP_PROXY="http://127.0.0.1:7897"
+```
+
+这是 **PowerShell 语法**。所以在 CMD 里会报：
+
+```text
+文件名、目录名或卷标语法不正确。
+```
+
+---
+
+## 你现在在 CMD 里，应该这样设置
+
+直接输入：
+
+```cmd
+set HTTP_PROXY=http://127.0.0.1:7897
+set HTTPS_PROXY=http://127.0.0.1:7897
+set http_proxy=http://127.0.0.1:7897
+set https_proxy=http://127.0.0.1:7897
+```
+
+查看是否设置成功：
+
+```cmd
+echo %HTTP_PROXY%
+echo %HTTPS_PROXY%
+```
+
+应该显示：
+
+```text
+http://127.0.0.1:7897
+```
+
+注意：`set` 只对**当前这个 CMD 窗口**生效，关掉窗口就没了。
+
+---
+
+## 如果你要永久设置，用 setx
+
+```cmd
+setx HTTP_PROXY "http://127.0.0.1:7897"
+setx HTTPS_PROXY "http://127.0.0.1:7897"
+setx http_proxy "http://127.0.0.1:7897"
+setx https_proxy "http://127.0.0.1:7897"
+```
+
+但是注意：`setx` 设置完后，**当前窗口不会立即生效**，你要重新打开 CMD / PowerShell / VS Code。
+
+---
+
+## 你 SSH 其实已经成功了
+
+这个结果很好：
+
+```text
+Hi Vik-W001! You've successfully authenticated, but GitHub does not provide shell access.
+```
+
+说明你现在的 SSH 配置已经能正常连 GitHub。
+
+所以 GitHub 推送现在直接执行：
+
+```cmd
+cd /d C:\Users\ufo28\Desktop\Mortor_Driver\vik_diy_foc\esp32_diy_foc\vik_diy_bldc_driver
+git push -u origin esp32_foc
+```
+
+如果之前已经设置过 upstream，以后直接：
+
+```cmd
+git push
+```
+
+---
+
+## Git 的 HTTPS 代理也可以在 CMD 里设置
+
+这个命令不分 CMD / PowerShell，都可以用：
+
+```cmd
+git config --global http.https://github.com.proxy http://127.0.0.1:7897
+git config --global --get http.https://github.com.proxy
+```
+
+但是你当前仓库是 SSH：
+
+```text
+git@github.com:Vik-W001/vik_diy_bldc_driver.git
+```
+
+所以主要还是靠：
+
+```sshconfig
+Host github.com
+    HostName ssh.github.com
+    User git
+    Port 443
+    ProxyCommand "C:/Program Files/Git/mingw64/bin/connect.exe" -H 127.0.0.1:7897 %h %p
+    ServerAliveInterval 30
+    ServerAliveCountMax 3
+```
+
+---
+
+## ESP-IDF 下载工具链，在 CMD 里这样跑
+
+比如你 ESP-IDF 在：
+
+```cmd
+C:\Espressif\frameworks\esp-idf-v5.5.3
+```
+
+那就：
+
+```cmd
+cd /d C:\Espressif\frameworks\esp-idf-v5.5.3
+
+set HTTP_PROXY=http://127.0.0.1:7897
+set HTTPS_PROXY=http://127.0.0.1:7897
+set http_proxy=http://127.0.0.1:7897
+set https_proxy=http://127.0.0.1:7897
+
+install.bat esp32s3
+```
+
+如果你是普通 ESP32：
+
+```cmd
+install.bat esp32
+```
+
+如果你不确定，就直接：
+
+```cmd
+install.bat
+```
+
+---
+
+## 总结一下
+
+你现在用 CMD，就用这个：
+
+```cmd
+set HTTP_PROXY=http://127.0.0.1:7897
+set HTTPS_PROXY=http://127.0.0.1:7897
+```
+
+不要用这个：
+
+```powershell
+$env:HTTP_PROXY="http://127.0.0.1:7897"
+```
+
+`$env:` 只能在 PowerShell 里用。
+
