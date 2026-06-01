@@ -636,3 +636,464 @@ cat in_anglvel_z_raw
 ```
 
 你现在最先做的是：**把 `bmi160_core.ko`、`bmi160_spi.ko`、`bmi160_spi_board.ko` 推到 `/tmp`，按顺序 insmod，然后把 `dmesg | tail -100` 的输出贴出来。**
+
+
+----------
+-----------
+----------
+你现在这个结果：
+
+```bash
+bmi160_core.ko
+bmi160_spi.ko
+```
+
+说明 **BMI160 驱动本体已经编出来了**。现在不是少两个都必须处理，而是：
+
+```text
+regmap-spi.ko          不一定缺，可能已经编进内核了
+bmi160_spi_board.ko    这个确实没编出来，需要处理
+```
+
+---
+
+## 1. 先确认 regmap-spi 到底是不是内置了
+
+执行：
+
+```bash
+cd ~/project/x2600/kernel/kernel
+
+grep -E "CONFIG_REGMAP|CONFIG_REGMAP_SPI|CONFIG_BMI160" .config
+```
+
+重点看这个：
+
+```bash
+CONFIG_REGMAP_SPI=y
+```
+
+如果是 `y`，那就正常，**不会生成 `regmap-spi.ko`**，因为它已经编进内核了。
+
+如果是：
+
+```bash
+CONFIG_REGMAP_SPI=m
+```
+
+但是你又找不到 `regmap-spi.ko`，那才需要重新编：
+
+```bash
+cd ~/project/x2600/kernel/kernel
+make M=drivers/base/regmap modules
+find drivers/base/regmap -name "*regmap*.ko"
+```
+
+所以你现在先不要管 `regmap-spi.ko`，大概率它没问题。
+
+---
+
+## 2. 重点是 bmi160_spi_board.ko 没出来
+
+你现在这个命令没找到：
+
+```bash
+find module_driver -name "*bmi160*.ko"
+```
+
+说明你的板级模块没有生成。
+
+先查源码目录还在不在：
+
+```bash
+cd ~/project/x2600
+
+find module_driver -maxdepth 4 -type d | grep -i bmi
+find module_driver -maxdepth 5 -type f | grep -i bmi
+```
+
+如果你能看到类似：
+
+```bash
+module_driver/bmi160_spi_board
+module_driver/bmi160_spi_board/bmi160_spi_board.c
+module_driver/bmi160_spi_board/Makefile
+```
+
+说明源码在，只是没编出来。
+
+---
+
+## 3. 先重新编 module_driver
+
+```bash
+cd ~/project/x2600/build
+
+make module_driver V=1 2>&1 | tee ~/module_driver_build.log
+```
+
+然后看有没有编 BMI160：
+
+```bash
+grep -i "bmi160" ~/module_driver_build.log
+```
+
+再找 ko：
+
+```bash
+cd ~/project/x2600
+find module_driver -name "*bmi160*.ko"
+```
+
+如果还是没有，说明 **module_driver 总 Makefile 没把 bmi160_spi_board 目录加进去**。
+
+---
+
+## 4. 如果 module_driver 没自动编，就手动编这个目录
+
+假设你的目录是：
+
+```bash
+~/project/x2600/module_driver/bmi160_spi_board
+```
+
+那执行：
+
+```bash
+cd ~/project/x2600/module_driver/bmi160_spi_board
+
+make -C ~/project/x2600/kernel/kernel M=$PWD modules V=1
+```
+
+然后再查：
+
+```bash
+find . -name "*.ko"
+```
+
+理想结果：
+
+```bash
+./bmi160_spi_board.ko
+```
+
+如果报交叉编译器找不到，再加工具链。先查工具链 gcc 名字：
+
+```bash
+ls ~/project/x2600/tools/toolchains/mips-xburst2-gcc720-glibc238/bin/*gcc
+```
+
+假设看到的是：
+
+```bash
+mips-linux-gnu-gcc
+```
+
+那就这样编：
+
+```bash
+cd ~/project/x2600/module_driver/bmi160_spi_board
+
+export PATH=~/project/x2600/tools/toolchains/mips-xburst2-gcc720-glibc238/bin:$PATH
+
+make -C ~/project/x2600/kernel/kernel \
+    M=$PWD \
+    ARCH=mips \
+    CROSS_COMPILE=mips-linux-gnu- \
+    modules V=1
+```
+
+如果你的 gcc 前缀不是 `mips-linux-gnu-`，就按实际名字改。比如看到：
+
+```bash
+mipsel-linux-gnu-gcc
+```
+
+那就是：
+
+```bash
+CROSS_COMPILE=mipsel-linux-gnu-
+```
+
+---
+
+## 5. 如果 bmi160_spi_board 目录根本不存在
+
+那就说明你现在只有 Linux 原生 BMI160 驱动，还没有“板级注册模块”。
+
+这种情况下，`bmi160_core.ko` 和 `bmi160_spi.ko` 可以加载，但**不会真正 probe BMI160**，因为系统不知道：
+
+```text
+哪一路 SPI 总线？
+哪个 CS？
+设备名字是什么？
+SPI mode 是多少？
+最大频率是多少？
+```
+
+也就是说，少了这个模块：
+
+```text
+bmi160_spi_board.ko
+```
+
+系统里不会自动出现：
+
+```text
+/sys/bus/iio/devices/iio:device0
+```
+
+---
+
+## 6. 板级模块的作用
+
+你可以理解成：
+
+```text
+bmi160_core.ko
+    ↓
+BMI160 通用核心驱动
+
+bmi160_spi.ko
+    ↓
+BMI160 通过 SPI 访问的驱动
+
+bmi160_spi_board.ko
+    ↓
+告诉内核：我的板子上 SPIx 的 CSx 接了一个 BMI160
+```
+
+所以你的加载顺序应该是：
+
+```bash
+insmod bmi160_core.ko
+insmod bmi160_spi.ko
+insmod bmi160_spi_board.ko
+```
+
+注意：最后这个 `bmi160_spi_board.ko` 才会真正触发设备创建和 probe。
+
+---
+
+## 7. 一个最小 bmi160_spi_board.c 参考
+
+如果你现在没有这个文件，可以先用类似这种方式写一个调试版。
+
+路径：
+
+```bash
+mkdir -p ~/project/x2600/module_driver/bmi160_spi_board
+cd ~/project/x2600/module_driver/bmi160_spi_board
+```
+
+创建：
+
+```bash
+vim bmi160_spi_board.c
+```
+
+内容参考：
+
+```c
+#include <linux/module.h>
+#include <linux/init.h>
+#include <linux/spi/spi.h>
+
+#define BMI160_SPI_BUS_NUM      0
+#define BMI160_SPI_CHIP_SELECT  0
+#define BMI160_SPI_MAX_HZ       1000000
+
+static struct spi_device *bmi160_spi_dev;
+
+static int __init bmi160_spi_board_init(void)
+{
+    struct spi_master *master;
+    struct spi_board_info spi_info = {
+        .modalias = "bmi160",
+        .max_speed_hz = BMI160_SPI_MAX_HZ,
+        .bus_num = BMI160_SPI_BUS_NUM,
+        .chip_select = BMI160_SPI_CHIP_SELECT,
+        .mode = SPI_MODE_0,
+    };
+
+    pr_info("bmi160_spi_board: init\n");
+
+    master = spi_busnum_to_master(BMI160_SPI_BUS_NUM);
+    if (!master) {
+        pr_err("bmi160_spi_board: spi bus %d not found\n", BMI160_SPI_BUS_NUM);
+        return -ENODEV;
+    }
+
+    bmi160_spi_dev = spi_new_device(master, &spi_info);
+    put_device(&master->dev);
+
+    if (!bmi160_spi_dev) {
+        pr_err("bmi160_spi_board: failed to create spi device\n");
+        return -ENODEV;
+    }
+
+    pr_info("bmi160_spi_board: created spi device bus=%d cs=%d\n",
+            BMI160_SPI_BUS_NUM, BMI160_SPI_CHIP_SELECT);
+
+    return 0;
+}
+
+static void __exit bmi160_spi_board_exit(void)
+{
+    pr_info("bmi160_spi_board: exit\n");
+
+    if (bmi160_spi_dev) {
+        spi_unregister_device(bmi160_spi_dev);
+        bmi160_spi_dev = NULL;
+    }
+}
+
+module_init(bmi160_spi_board_init);
+module_exit(bmi160_spi_board_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("vik");
+MODULE_DESCRIPTION("BMI160 SPI board device register module");
+```
+
+再创建 Makefile：
+
+```bash
+vim Makefile
+```
+
+内容：
+
+```makefile
+obj-m += bmi160_spi_board.o
+```
+
+然后编译：
+
+```bash
+cd ~/project/x2600/module_driver/bmi160_spi_board
+
+make -C ~/project/x2600/kernel/kernel M=$PWD modules V=1
+```
+
+编译完应该有：
+
+```bash
+bmi160_spi_board.ko
+```
+
+---
+
+## 8. 注意你的 PD05 不是直接写到 chip_select 里面
+
+你说你的 CS 是 `PD05`，这里要注意：
+
+```c
+.chip_select = 0
+```
+
+这里的 `0` 不是 GPIO 编号，也不是 PD05。
+
+它表示：
+
+```text
+SPI 控制器的第 0 个片选
+```
+
+所以你要确认 PD05 在君正 X2600 平台里是不是被配置成了这个 SPI 控制器的 CS0。
+
+如果 PD05 只是普通 GPIO，而不是 SPI 控制器管理的 CS，那上面的普通写法可能还不够，需要在平台 pinctrl / SPI controller / DTS / 板级代码里配置 `cs-gpios` 或者君正自己的片选配置。
+
+先别急着改，调试第一步可以先查板子上有哪些 SPI master：
+
+```bash
+ls /sys/class/spi_master/
+ls /sys/bus/spi/devices/
+```
+
+如果看到：
+
+```bash
+spi0
+```
+
+那板级模块里：
+
+```c
+#define BMI160_SPI_BUS_NUM 0
+```
+
+如果看到：
+
+```bash
+spi1
+```
+
+那就改成：
+
+```c
+#define BMI160_SPI_BUS_NUM 1
+```
+
+---
+
+## 9. 你现在应该按这个顺序做
+
+### 第一步：确认 regmap
+
+```bash
+cd ~/project/x2600/kernel/kernel
+grep -E "CONFIG_REGMAP_SPI|CONFIG_BMI160" .config
+```
+
+如果是：
+
+```bash
+CONFIG_REGMAP_SPI=y
+```
+
+不用管它。
+
+---
+
+### 第二步：查 board 源码
+
+```bash
+cd ~/project/x2600
+find module_driver -maxdepth 5 -type f | grep -i bmi
+```
+
+如果有源码，编它。
+
+如果没有源码，新建 `module_driver/bmi160_spi_board`。
+
+---
+
+### 第三步：编 board ko
+
+```bash
+cd ~/project/x2600/module_driver/bmi160_spi_board
+make -C ~/project/x2600/kernel/kernel M=$PWD modules V=1
+```
+
+---
+
+### 第四步：最终你应该有这三个
+
+```bash
+cd ~/project/x2600
+
+find kernel/kernel -name "bmi160_core.ko"
+find kernel/kernel -name "bmi160_spi.ko"
+find module_driver -name "bmi160_spi_board.ko"
+```
+
+结果应该类似：
+
+```bash
+kernel/kernel/drivers/iio/imu/bmi160/bmi160_core.ko
+kernel/kernel/drivers/iio/imu/bmi160/bmi160_spi.ko
+module_driver/bmi160_spi_board/bmi160_spi_board.ko
+```
+
+这三个有了，就可以推到板子 `/tmp` 手动加载了。
