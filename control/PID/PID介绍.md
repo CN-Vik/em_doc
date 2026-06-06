@@ -31,11 +31,14 @@ $$K_i=\dfrac{K_p\cdot T}{T_i},\quad K_d=\dfrac{K_p\cdot T_d}{T}$$
 
 ## 四、增量式PID（电机、温控最常用！）
 只算**输出变化量**，不易积分饱和，工业首选
+
 $$
+
 \Delta u(k) =
 K_p\big[e(k)-e(k-1)\big]
 + K_i e(k)
 + K_d\big[e(k)-2e(k-1)+e(k-2)\big]
+
 $$
 新输出：$u(k) = u(k-1) + \Delta u(k)$
 
