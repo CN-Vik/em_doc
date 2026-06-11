@@ -607,4 +607,826 @@ iio:device0
 
 然后再按 SC7U22 手册逐个补初始化寄存器。
 
+-------
+--------
+--------
 
+可以，你这个需求应该这样做：
+
+**继续使用 IIO 框架，但是当前阶段只做一件事：probe 时读 `WHO_AM_I`，读到 `0x6A` 后注册一个最小 IIO 设备。**
+
+也就是：
+
+```text
+SPI 通信
+  ↓
+regmap_read(WHO_AM_I)
+  ↓
+ID 正确
+  ↓
+devm_iio_device_register()
+  ↓
+/sys/bus/iio/devices/iio:device0
+```
+
+当前先不要：
+
+```text
+soft reset
+PWR_CTRL
+ACC/GYR 初始化
+read_raw 读加速度/陀螺仪
+trigger buffer
+```
+
+你现在旧 `sc7u22_core.c` 里虽然注释了 `set_mode()`，但是 `chip_init()` 仍然在写 soft reset、读 dummy、再读 ID，这不是“只读 ID”。
+
+---
+
+# 一、`sc7u22_spi_board.c` 不用改
+
+你这个 board 文件可以保持：
+
+```c
+.modalias = "sc7u22",
+.max_speed_hz = 5 * 100 * 1000,
+.mode = SPI_MODE_3,
+.chip_select = 0,
+.controller_data = (void *)GPIO_PD(5),
+```
+
+它的作用就是创建 `spi0.0`。这个没问题。
+
+---
+
+# 二、`sc7u22_spi.c` 改成：只创建 regmap，不预读 ID
+
+你现在 `sc7u22_spi.c` 里还有这些调试读：
+
+```c
+sc7u22_spi_raw_read_id(spi);
+
+direct custom_read
+
+regmap_read(regmap, 0x01, &val);
+```
+
+这些都先去掉。原因是你前面日志已经证明：**第一笔读能读到 0x6A，后续读可能变 0x00**。所以不要在 `spi_probe()` 里提前消耗第一笔读。
+
+把 `sc7u22_spi.c` 改成下面这种结构：
+
+```c
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * SC7U22 SPI driver
+ */
+
+#include <linux/module.h>
+#include <linux/of.h>
+#include <linux/acpi.h>
+#include <linux/regmap.h>
+#include <linux/spi/spi.h>
+#include <linux/slab.h>
+
+#include "sc7u22.h"
+
+/*
+ * SC7U22 SPI read:
+ * bit7 = 1 表示读
+ * bit6~bit0 = 寄存器地址
+ *
+ * 读 WHO_AM_I:
+ * reg = 0x01
+ * cmd = 0x80 | 0x01 = 0x81
+ */
+static int sc7u22_spi_reg_read(void *context,
+                               const void *reg_buf, size_t reg_size,
+                               void *val_buf, size_t val_size)
+{
+    struct spi_device *spi = context;
+    const u8 *reg = reg_buf;
+    u8 *tx;
+    u8 *rx;
+    int ret;
+
+    if (reg_size != 1 || val_size == 0)
+        return -EINVAL;
+
+    tx = kzalloc(1, GFP_KERNEL);
+    if (!tx)
+        return -ENOMEM;
+
+    rx = kzalloc(val_size, GFP_KERNEL);
+    if (!rx) {
+        kfree(tx);
+        return -ENOMEM;
+    }
+
+    tx[0] = reg[0] | 0x80;
+
+    ret = spi_write_then_read(spi, tx, 1, rx, val_size);
+    if (ret) {
+        dev_err(&spi->dev,
+                "reg_read failed: reg=0x%02x cmd=0x%02x ret=%d\n",
+                reg[0], tx[0], ret);
+        goto out;
+    }
+
+    memcpy(val_buf, rx, val_size);
+
+    dev_info(&spi->dev,
+             "reg_read: reg=0x%02x cmd=0x%02x len=%zu val0=0x%02x\n",
+             reg[0], tx[0], val_size, rx[0]);
+
+out:
+    kfree(rx);
+    kfree(tx);
+    return ret;
+}
+
+static int sc7u22_spi_reg_write(void *context,
+                                const void *data, size_t count)
+{
+    struct spi_device *spi = context;
+    u8 *tx;
+    int ret;
+
+    if (count == 0)
+        return -EINVAL;
+
+    tx = kmemdup(data, count, GFP_KERNEL);
+    if (!tx)
+        return -ENOMEM;
+
+    dev_info(&spi->dev,
+             "reg_write: reg=0x%02x count=%zu\n",
+             tx[0], count);
+
+    ret = spi_write(spi, tx, count);
+
+    kfree(tx);
+    return ret;
+}
+
+static const struct regmap_bus sc7u22_spi_regmap_bus = {
+    .read = sc7u22_spi_reg_read,
+    .write = sc7u22_spi_reg_write,
+};
+
+static int sc7u22_spi_probe(struct spi_device *spi)
+{
+    int ret;
+    struct regmap *regmap;
+    const struct spi_device_id *id = spi_get_device_id(spi);
+
+    dev_info(&spi->dev, "vik sc7u22_spi IIO ID-only version 2026-06-10-02\n");
+    dev_info(&spi->dev, "sc7u22 spi probe enter\n");
+
+    spi->mode = SPI_MODE_3;
+    spi->bits_per_word = 8;
+    spi->max_speed_hz = 500000;
+
+    ret = spi_setup(spi);
+    if (ret) {
+        dev_err(&spi->dev, "spi_setup failed: %d\n", ret);
+        return ret;
+    }
+
+    dev_info(&spi->dev,
+             "spi mode=%u bits=%u max_speed=%u\n",
+             spi->mode, spi->bits_per_word, spi->max_speed_hz);
+
+    regmap = devm_regmap_init(&spi->dev,
+                              &sc7u22_spi_regmap_bus,
+                              spi,
+                              &sc7u22_regmap_config);
+    if (IS_ERR(regmap)) {
+        dev_err(&spi->dev, "Failed to register spi regmap: %pe\n", regmap);
+        return PTR_ERR(regmap);
+    }
+
+    if (!id) {
+        dev_err(&spi->dev, "spi_device_id is NULL\n");
+        return -ENODEV;
+    }
+
+    return sc7u22_core_probe(&spi->dev, regmap, id->name, true);
+}
+
+static const struct spi_device_id sc7u22_spi_id[] = {
+    { "sc7u22", 0 },
+    { }
+};
+MODULE_DEVICE_TABLE(spi, sc7u22_spi_id);
+
+static const struct acpi_device_id sc7u22_acpi_match[] = {
+    { "SC7U22", 0 },
+    { }
+};
+MODULE_DEVICE_TABLE(acpi, sc7u22_acpi_match);
+
+#ifdef CONFIG_OF
+static const struct of_device_id sc7u22_of_match[] = {
+    { .compatible = "qst,sc7u22" },
+    { }
+};
+MODULE_DEVICE_TABLE(of, sc7u22_of_match);
+#endif
+
+static struct spi_driver sc7u22_spi_driver = {
+    .probe = sc7u22_spi_probe,
+    .id_table = sc7u22_spi_id,
+    .driver = {
+        .name = "sc7u22_spi",
+        .acpi_match_table = ACPI_PTR(sc7u22_acpi_match),
+        .of_match_table = of_match_ptr(sc7u22_of_match),
+    },
+};
+
+module_spi_driver(sc7u22_spi_driver);
+
+MODULE_DESCRIPTION("SC7U22 SPI IIO ID-only driver");
+MODULE_LICENSE("GPL v2");
+```
+
+关键点：**`sc7u22_spi_probe()` 里面不再提前读 ID。**
+
+---
+
+# 三、`sc7u22_core.c` 改成 IIO ID-only 版本
+
+这个版本仍然使用 IIO 框架，但只做：
+
+1. `regmap_read(0x01)` 读 ID；
+2. ID 是 `0x6A` 就注册 IIO；
+3. 提供一个 `/sys/bus/iio/devices/iio:deviceX/chip_id` 节点；
+4. 不读加速度/陀螺仪数据；
+5. 不 setup trigger buffer。
+
+直接先把 `sc7u22_core.c` 改成这个最小版本：
+
+```c
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * SC7U22 IIO core driver - ID only stage
+ */
+
+#include <linux/module.h>
+#include <linux/regmap.h>
+#include <linux/delay.h>
+
+#include <linux/iio/iio.h>
+#include <linux/iio/sysfs.h>
+
+#include "sc7u22.h"
+
+const struct regmap_config sc7u22_regmap_config = {
+    .reg_bits = 8,
+    .val_bits = 8,
+};
+EXPORT_SYMBOL_GPL(sc7u22_regmap_config);
+
+/*
+ * IIO sysfs:
+ * /sys/bus/iio/devices/iio:deviceX/chip_id
+ */
+static ssize_t sc7u22_chip_id_show(struct device *dev,
+                                   struct device_attribute *attr,
+                                   char *buf)
+{
+    struct iio_dev *indio_dev = dev_to_iio_dev(dev);
+    struct sc7u22_data *data = iio_priv(indio_dev);
+    unsigned int val;
+    int ret;
+
+    ret = regmap_read(data->regmap, SC7U22_REG_CHIP_ID, &val);
+    if (ret)
+        return ret;
+
+    return sprintf(buf, "0x%02x\n", val);
+}
+
+static IIO_DEVICE_ATTR(chip_id, 0444,
+                       sc7u22_chip_id_show,
+                       NULL,
+                       0);
+
+static struct attribute *sc7u22_attrs[] = {
+    &iio_dev_attr_chip_id.dev_attr.attr,
+    NULL,
+};
+
+static const struct attribute_group sc7u22_attrs_group = {
+    .attrs = sc7u22_attrs,
+};
+
+static const struct iio_info sc7u22_info = {
+    .attrs = &sc7u22_attrs_group,
+};
+
+static int sc7u22_chip_init_id_only(struct sc7u22_data *data)
+{
+    int ret;
+    unsigned int val;
+    struct device *dev = regmap_get_device(data->regmap);
+
+    dev_info(dev, "SC7U22 chip_init: ID only mode\n");
+
+    /*
+     * 先延时一下，避免设备刚注册后马上读。
+     */
+    msleep(5);
+
+    ret = regmap_read(data->regmap, SC7U22_REG_CHIP_ID, &val);
+    dev_info(dev,
+             "SC7U22 WHO_AM_I ret=%d val=0x%02x expected=0x%02x\n",
+             ret, val, SC7U22_CHIP_ID_VAL);
+
+    if (ret)
+        return ret;
+
+    if (val != SC7U22_CHIP_ID_VAL) {
+        dev_err(dev,
+                "SC7U22 wrong chip id: got 0x%02x expected 0x%02x\n",
+                val, SC7U22_CHIP_ID_VAL);
+        return -ENODEV;
+    }
+
+    dev_info(dev, "SC7U22 chip id OK\n");
+
+    return 0;
+}
+
+int sc7u22_core_probe(struct device *dev, struct regmap *regmap,
+                      const char *name, bool use_spi)
+{
+    struct iio_dev *indio_dev;
+    struct sc7u22_data *data;
+    int ret;
+
+    dev_info(dev, "SC7U22 core probe: IIO ID-only mode\n");
+
+    indio_dev = devm_iio_device_alloc(dev, sizeof(*data));
+    if (!indio_dev)
+        return -ENOMEM;
+
+    data = iio_priv(indio_dev);
+    dev_set_drvdata(dev, indio_dev);
+
+    data->regmap = regmap;
+
+    ret = sc7u22_chip_init_id_only(data);
+    if (ret)
+        return ret;
+
+    /*
+     * ID-only 阶段：
+     * 不配置 channels
+     * 不实现 read_raw
+     * 不配置 trigger buffer
+     */
+    indio_dev->name = name ? name : "sc7u22";
+    indio_dev->modes = INDIO_DIRECT_MODE;
+    indio_dev->info = &sc7u22_info;
+
+    ret = devm_iio_device_register(dev, indio_dev);
+    if (ret) {
+        dev_err(dev, "failed to register IIO device: %d\n", ret);
+        return ret;
+    }
+
+    dev_info(dev, "SC7U22 IIO device registered, ID-only mode\n");
+
+    return 0;
+}
+EXPORT_SYMBOL_GPL(sc7u22_core_probe);
+
+MODULE_DESCRIPTION("SC7U22 IIO core driver - ID only");
+MODULE_LICENSE("GPL v2");
+```
+
+---
+
+# 四、`sc7u22.h` 需要保留这些宏
+
+你现在头文件里已经有这些，OK：
+
+```c
+#define SC7U22_CHIP_ID_VAL      0x6A
+#define SC7U22_REG_CHIP_ID      0x01
+```
+
+并且 `struct sc7u22_data` 里有：
+
+```c
+struct regmap *regmap;
+```
+
+这就够 ID-only 阶段用了。
+
+---
+
+# 五、加载模块流程
+
+这个版本还是用 IIO，所以要加载：
+
+```text
+sc7u22_core.ko
+sc7u22_spi.ko
+sc7u22_spi_board.ko
+```
+
+但是不需要加载：
+
+```text
+industrialio-triggered-buffer.ko
+```
+
+因为这个 ID-only 版没有调用 `devm_iio_triggered_buffer_setup()`。
+
+完整加载：
+
+```sh
+cd /lib/modules/5.10.186
+
+rmmod sc7u22_spi_board 2>/dev/null
+rmmod sc7u22_spi 2>/dev/null
+rmmod sc7u22_core 2>/dev/null
+rmmod industrialio_triggered_buffer 2>/dev/null
+rmmod soc_spi 2>/dev/null
+rmmod utils 2>/dev/null
+
+insmod ./utils.ko
+
+insmod ./soc_spi.ko spi0_is_enable=1 spi1_is_enable=0 div_ssi_rate=10000000 spi0_clk=PD00 spi0_mosi=PD01 spi0_miso=PD02
+
+echo "==== spi master ===="
+ls /sys/class/spi_master/
+
+insmod ./sc7u22_core.ko
+insmod ./sc7u22_spi.ko
+insmod ./sc7u22_spi_board.ko
+
+echo "==== dmesg ===="
+dmesg | tail -n 120
+
+echo "==== spi devices ===="
+ls /sys/bus/spi/devices/
+
+echo "==== iio devices ===="
+ls /sys/bus/iio/devices/
+```
+
+---
+
+# 六、成功后怎么验证
+
+如果成功，你应该看到：
+
+```sh
+ls /sys/bus/iio/devices/
+```
+
+输出类似：
+
+```text
+iio:device0
+```
+
+然后读 ID：
+
+```sh
+cat /sys/bus/iio/devices/iio:device0/name
+cat /sys/bus/iio/devices/iio:device0/chip_id
+```
+
+期望：
+
+```text
+sc7u22
+0x6a
+```
+
+dmesg 里应该有：
+
+```text
+SC7U22 core probe: IIO ID-only mode
+SC7U22 chip_init: ID only mode
+SC7U22 WHO_AM_I ret=0 val=0x6a expected=0x6a
+SC7U22 chip id OK
+SC7U22 IIO device registered, ID-only mode
+```
+
+---
+
+## 当前你要注意的点
+
+你之前的 `sc7u22_core_probe()` 是先 `sc7u22_chip_init()`，成功后才配置 IIO 并 `devm_iio_device_register()`；所以只要 chip init 返回失败，`/sys/bus/iio/devices/` 就一定是空的。
+
+现在这个 ID-only 版的目的就是：**让 IIO 框架先跑通，只暴露一个 chip_id 节点。等这个通了，再慢慢加 soft reset、PWR_CTRL、ACC/GYR 初始化、read_raw。**
+
+
+-----
+------
+-------
+可以了，这次**已经成功了**。
+
+关键日志不是前面的 `utils: Unknown symbol`，那是之前失败的旧日志。你真正这次成功的关键在后面：
+
+```text
+[ 579.128120] sc7u22_spi spi0.0: SC7U22 core probe: IIO ID-only mode
+[ 579.128145] sc7u22_spi spi0.0: SC7U22 chip_init: ID only mode
+[ 579.150231] sc7u22_spi spi0.0: reg_read: reg=0x01 cmd=0x81 len=1 val0=0x6a
+[ 579.150248] sc7u22_spi spi0.0: SC7U22 WHO_AM_I ret=0 val=0x6a expected=0x6a
+[ 579.150256] sc7u22_spi spi0.0: SC7U22 chip id OK
+[ 579.150466] sc7u22_spi spi0.0: SC7U22 IIO device registered, ID-only mode
+```
+
+然后你这里也出来了：
+
+```sh
+ls /sys/bus/spi/devices/
+spi0.0
+
+ls /sys/bus/iio/devices/
+iio:device0
+```
+
+这说明这几条链路全部通了：
+
+```text
+utils.ko / soc_spi.ko
+  ↓
+spi0 master
+  ↓
+sc7u22_spi_board.ko 创建 spi0.0
+  ↓
+sc7u22_spi.ko probe
+  ↓
+regmap 通过 SPI 读 WHO_AM_I = 0x6A
+  ↓
+sc7u22_core.ko 注册 IIO
+  ↓
+/sys/bus/iio/devices/iio:device0
+```
+
+所以之前担心的“君正这种方式用不了 IIO”可以排除了，**君正 SPI + board 注册 + regmap + IIO 是可以跑通的。**
+
+---
+
+## 现在马上验证一下 sysfs
+
+执行：
+
+```sh
+cat /sys/bus/iio/devices/iio:device0/name
+cat /sys/bus/iio/devices/iio:device0/chip_id
+```
+
+期望大概是：
+
+```text
+sc7u22
+0x6a
+```
+
+如果 `chip_id` 能读到 `0x6a`，那 ID-only IIO 阶段就彻底 OK。
+
+---
+
+## 前面的 `utils Unknown symbol` 怎么看？
+
+不用管，那是旧日志。因为你的 `dmesg` 没清掉，之前失败的记录还在里面。
+
+这次实际已经加载成功了，否则不会有：
+
+```text
+spi0.0
+iio:device0
+```
+
+后面看日志时可以用这种方式过滤：
+
+```sh
+dmesg | grep -i sc7u22
+```
+
+或者：
+
+```sh
+dmesg | tail -n 40
+```
+
+---
+
+## 下一步建议
+
+现在先别急着读 IMU 数据。先把这个版本保存下来，作为稳定基线：
+
+```text
+阶段 1：IIO 框架 + SPI + regmap + WHO_AM_I 只读 ID 成功
+```
+
+然后下一步再慢慢加初始化，顺序建议是：
+
+```text
+1. 加 soft reset，reset 后再读 WHO_AM_I
+2. 加 PWR_CTRL，只打开 ACC/GYR
+3. 加 ACC_CONF / ACC_RANGE
+4. 加 GYR_CONF / GYR_RANGE
+5. 每写一个寄存器，就 readback 验证
+6. 最后再实现 read_raw 读加速度/陀螺仪数据
+```
+
+不要一次全加。你现在这个状态已经很关键了，说明底层框架没问题，后面就是按 SC7U22 手册补初始化和数据寄存器读取。
+
+
+
+---------
+--------
+-------
+
+
+这不算全失败。**IIO 节点已经注册成功了**，说明这条链路已经通了：
+
+```text
+SPI master -> spi0.0 -> sc7u22_spi probe -> regmap -> IIO 注册
+```
+
+现在的问题是：**probe 阶段第一次读 ID 是 0x6A，但你 cat `chip_id` 时又重新读了一次寄存器，这次读成了 0x00。**
+
+你日志里已经证明 probe 时读 ID 成功：
+
+```text
+reg_read: reg=0x01 cmd=0x81 len=1 val0=0x6a
+SC7U22 WHO_AM_I ret=0 val=0x6a expected=0x6a
+SC7U22 chip id OK
+SC7U22 IIO device registered, ID-only mode
+```
+
+所以 `/sys/bus/iio/devices/iio:device0` 能出来。你现在 `cat chip_id = 0x00`，说明 `chip_id_show()` 里面又做了一次 `regmap_read(0x01)`，而这次读失败成 0 了。这个和你前面遇到的“第一笔读到 0x6A，后续读到 0x00”是同一个问题。
+
+---
+
+## 先确认一下
+
+你执行：
+
+```sh
+dmesg | grep -i "reg_read\|SC7U22\|chip_id" | tail -n 80
+```
+
+大概率会看到你 `cat chip_id` 之后又出现一条：
+
+```text
+reg_read: reg=0x01 cmd=0x81 len=1 val0=0x00
+```
+
+---
+
+## 当前 ID-only 阶段，建议先用“缓存 ID”
+
+既然 probe 阶段已经读到 `0x6A`，那 ID-only IIO 阶段可以先把 ID 缓存起来。`cat chip_id` 不要再实时读 SPI，直接返回 probe 时读到的值。
+
+这样可以先确认：
+
+```text
+IIO 框架注册 OK
+sysfs 节点 OK
+chip_id 属性 OK
+```
+
+后面再单独解决“重复 SPI 读有时变 0”的问题。
+
+---
+
+## 1. 修改 `sc7u22.h`
+
+在 `struct sc7u22_data` 里加一个缓存字段：
+
+```c
+struct sc7u22_data {
+    struct regmap *regmap;
+    struct iio_trigger *trig;
+    struct regulator_bulk_data supplies[2];
+    struct iio_mount_matrix orientation;
+
+    /*
+     * ID-only 调试阶段：
+     * probe 时读到的 WHO_AM_I 缓存在这里。
+     */
+    u8 chip_id;
+
+    __le16 buf[12] __aligned(8);
+};
+```
+
+---
+
+## 2. 修改 `sc7u22_chip_init_id_only()`
+
+把 probe 阶段读到的 ID 存起来：
+
+```c
+static int sc7u22_chip_init_id_only(struct sc7u22_data *data)
+{
+    int ret;
+    unsigned int val;
+    struct device *dev = regmap_get_device(data->regmap);
+
+    dev_info(dev, "SC7U22 chip_init: ID only mode\n");
+
+    msleep(5);
+
+    ret = regmap_read(data->regmap, SC7U22_REG_CHIP_ID, &val);
+    dev_info(dev,
+             "SC7U22 WHO_AM_I ret=%d val=0x%02x expected=0x%02x\n",
+             ret, val, SC7U22_CHIP_ID_VAL);
+
+    if (ret)
+        return ret;
+
+    if (val != SC7U22_CHIP_ID_VAL) {
+        dev_err(dev,
+                "SC7U22 wrong chip id: got 0x%02x expected 0x%02x\n",
+                val, SC7U22_CHIP_ID_VAL);
+        return -ENODEV;
+    }
+
+    data->chip_id = val & 0xff;
+
+    dev_info(dev, "SC7U22 chip id OK, cached chip_id=0x%02x\n",
+             data->chip_id);
+
+    return 0;
+}
+```
+
+---
+
+## 3. 修改 `chip_id_show()`
+
+不要实时 `regmap_read()`，先返回缓存值：
+
+```c
+static ssize_t sc7u22_chip_id_show(struct device *dev,
+                                   struct device_attribute *attr,
+                                   char *buf)
+{
+    struct iio_dev *indio_dev = dev_to_iio_dev(dev);
+    struct sc7u22_data *data = iio_priv(indio_dev);
+
+    return sprintf(buf, "0x%02x\n", data->chip_id);
+}
+```
+
+这样再执行：
+
+```sh
+cat /sys/bus/iio/devices/iio:device0/chip_id
+```
+
+应该就是：
+
+```text
+0x6a
+```
+
+---
+
+## 这个修改代表什么？
+
+这代表 **IIO ID-only 阶段完成**。但它不代表“重复 SPI 读寄存器已经完全稳定”。
+
+你现在实际状态是：
+
+```text
+probe 第一次读 WHO_AM_I：成功 0x6A
+IIO 注册：成功
+sysfs chip_id 实时再读：变 0x00
+```
+
+所以后面要单独解决的是：
+
+```text
+为什么同样读 0x01，第一次是 0x6A，后续读成 0x00？
+```
+
+这个可能和 SC7U22 的 SPI 时序、CS 间隔、君正 SPI 控制器连续读、或者芯片进入某种状态有关。
+
+---
+
+## 下一步建议
+
+先把 `chip_id` 改成缓存值，让 IIO 框架阶段彻底稳定。然后我们再加一个新的 sysfs 节点，比如：
+
+```text
+chip_id_live
+```
+
+专门用来实时读寄存器调试。这样可以同时区分：
+
+```text
+chip_id       = probe 缓存值，验证 IIO
+chip_id_live  = 实时 SPI 读值，调试重复读问题
+```
