@@ -1781,3 +1781,766 @@ IDLE：一帧数据可能结束了。
 
 你现在打印卡死，核心就是 **把 TC 当成 TXE 用了，而且还在 SysTick 高频中断里 printf**。
 正确做法是：**普通打印用 TXE / 中断 / DMA，只有整帧最后才考虑 TC。**
+
+
+
+-------
+---------
+--------
+# 异步打印和+DMA搬运数据
+
+可以，**异步打印 + DMA 搬运数据** 非常适合你这个场景。
+
+你现在最适合改成这个架构：
+
+```c id="79jdku"
+printf / debug_printf_string
+        ↓
+写入日志环形缓冲区
+        ↓
+如果 DMA 空闲，启动 DMA 发送一段数据
+        ↓
+DMA 后台搬运到 USART3->DR
+        ↓
+DMA 发送完成中断
+        ↓
+继续发送下一段日志
+```
+
+核心原则：
+
+```c id="2v6x4y"
+业务代码只负责“塞日志”
+DMA负责“慢慢发日志”
+日志满了可以丢
+系统绝对不能卡
+```
+
+---
+
+# 1. 可以，但不要混用 TXE 中断发送和 DMA 发送
+
+你现在代码里有两套发送方式：
+
+### TXE 中断发送
+
+```c id="oqo8cb"
+USART_ITConfig(USART3, USART_IT_TXE, ENABLE);
+```
+
+### DMA 发送
+
+```c id="2f8av6"
+USART_DMACmd(USART3, USART_DMAReq_Tx, ENABLE);
+```
+
+这两套最好不要同时用于同一个 USART3。否则可能出现：
+
+```text id="ccjjww"
+TXE中断在发
+DMA也在发
+两个发送源抢 USART3->DR
+数据乱序 / 丢字节 / 卡死
+```
+
+所以建议：
+
+```c id="0758w8"
+日志打印统一用 DMA
+USART3 TXE 中断发送那套先不用
+```
+
+也就是：
+
+```c id="vfdrg8"
+USART_ITConfig(USART3, USART_IT_TXE, DISABLE);
+```
+
+---
+
+# 2. 推荐代码结构
+
+你可以新增一套文件，比如：
+
+```c id="3ao5cv"
+drv_uart3_log_dma.c
+drv_uart3_log_dma.h
+```
+
+也可以直接放进 `drv_uart_3.c` 里面。
+
+下面这个版本是 **裸机可用版**，不用 FreeRTOS。
+
+---
+
+# 3. 头文件声明
+
+```c id="t35yue"
+#ifndef __DRV_UART3_LOG_DMA_H
+#define __DRV_UART3_LOG_DMA_H
+
+#include "main.h"
+
+void drv_uart3_log_dma_init(void);
+void drv_uart3_log_write(const u8 *data, u16 len);
+void drv_uart3_log_putchar(char ch);
+u32 drv_uart3_log_get_drop_count(void);
+
+#endif
+```
+
+---
+
+# 4. DMA 异步日志核心代码
+
+```c id="ni8i9k"
+#include "drv_uart3_log_dma.h"
+#include "board.h"
+#include <string.h>
+#include <stdio.h>
+
+#define UART3_LOG_RING_SIZE     1024    // 日志环形缓冲区大小
+#define UART3_DMA_TX_SIZE       128     // 每次DMA最多发送128字节
+
+static volatile u16 uart3_log_head = 0;
+static volatile u16 uart3_log_tail = 0;
+static volatile u8  uart3_dma_busy = 0;
+static volatile u32 uart3_log_drop_cnt = 0;
+
+static u8 uart3_log_ring_buf[UART3_LOG_RING_SIZE];
+static u8 uart3_dma_tx_buf[UART3_DMA_TX_SIZE];
+
+static DMA_InitTypeDef uart3_dma_init_structure;
+
+
+/**
+ * @brief 进入临界区
+ */
+static u32 log_irq_save(void)
+{
+    u32 primask = __get_PRIMASK();
+    __disable_irq();
+    return primask;
+}
+
+
+/**
+ * @brief 退出临界区
+ */
+static void log_irq_restore(u32 primask)
+{
+    __set_PRIMASK(primask);
+}
+
+
+/**
+ * @brief 获取环形缓冲区下一个位置
+ */
+static u16 log_ring_next_pos(u16 pos)
+{
+    pos++;
+
+    if (pos >= UART3_LOG_RING_SIZE)
+    {
+        pos = 0;
+    }
+
+    return pos;
+}
+
+
+/**
+ * @brief 启动下一段DMA发送
+ */
+static void drv_uart3_log_dma_start_next(void)
+{
+    u16 len = 0;
+    u32 primask;
+
+    primask = log_irq_save();
+
+    // DMA正在发送，直接退出
+    if (uart3_dma_busy)
+    {
+        log_irq_restore(primask);
+        return;
+    }
+
+    // 没有数据要发，直接退出
+    if (uart3_log_head == uart3_log_tail)
+    {
+        log_irq_restore(primask);
+        return;
+    }
+
+    uart3_dma_busy = 1;
+
+    // 从环形缓冲区拷贝一段数据到DMA发送缓冲区
+    while ((uart3_log_tail != uart3_log_head) && (len < UART3_DMA_TX_SIZE))
+    {
+        uart3_dma_tx_buf[len] = uart3_log_ring_buf[uart3_log_tail];
+        len++;
+
+        uart3_log_tail = log_ring_next_pos(uart3_log_tail);
+    }
+
+    log_irq_restore(primask);
+
+    if (len == 0)
+    {
+        uart3_dma_busy = 0;
+        return;
+    }
+
+    // 关闭DMA通道，重新配置
+    DMA_Cmd(UART3_Tx_DMA_Channel, DISABLE);
+
+    // 清除DMA标志
+    DMA_ClearFlag(USRT3_Tx_DMA_FLAG);
+
+    // 重新配置DMA内存地址和长度
+    uart3_dma_init_structure.DMA_PeripheralBaseAddr = (u32)(&USART3->DR);
+    uart3_dma_init_structure.DMA_MemoryBaseAddr = (u32)uart3_dma_tx_buf;
+    uart3_dma_init_structure.DMA_DIR = DMA_DIR_PeripheralDST;
+    uart3_dma_init_structure.DMA_BufferSize = len;
+    uart3_dma_init_structure.DMA_PeripheralInc = DMA_PeripheralInc_Disable;
+    uart3_dma_init_structure.DMA_MemoryInc = DMA_MemoryInc_Enable;
+    uart3_dma_init_structure.DMA_PeripheralDataSize = DMA_PeripheralDataSize_Byte;
+    uart3_dma_init_structure.DMA_MemoryDataSize = DMA_MemoryDataSize_Byte;
+    uart3_dma_init_structure.DMA_Mode = DMA_Mode_Normal;
+    uart3_dma_init_structure.DMA_Priority = DMA_Priority_VeryHigh;
+    uart3_dma_init_structure.DMA_M2M = DMA_M2M_Disable;
+
+    DMA_Init(UART3_Tx_DMA_Channel, &uart3_dma_init_structure);
+
+    // 开启DMA发送完成中断
+    DMA_ITConfig(UART3_Tx_DMA_Channel, DMA_IT_TC, ENABLE);
+
+    // 使能USART3 DMA发送请求
+    USART_DMACmd(USART3, USART_DMAReq_Tx, ENABLE);
+
+    // 开始DMA发送
+    DMA_Cmd(UART3_Tx_DMA_Channel, ENABLE);
+}
+
+
+/**
+ * @brief 初始化USART3日志DMA
+ * @note  这个函数要在 drv_uart3_init() 后面调用
+ */
+void drv_uart3_log_dma_init(void)
+{
+    NVIC_InitTypeDef NVIC_InitStructure;
+
+    uart3_log_head = 0;
+    uart3_log_tail = 0;
+    uart3_dma_busy = 0;
+    uart3_log_drop_cnt = 0;
+
+    memset(uart3_log_ring_buf, 0, sizeof(uart3_log_ring_buf));
+    memset(uart3_dma_tx_buf, 0, sizeof(uart3_dma_tx_buf));
+
+    // 确保USART3的TXE中断关闭，不要和DMA抢发送
+    USART_ITConfig(USART3, USART_IT_TXE, DISABLE);
+
+    // 初始化DMA通道
+    DMA_Cmd(UART3_Tx_DMA_Channel, DISABLE);
+    DMA_DeInit(UART3_Tx_DMA_Channel);
+
+    uart3_dma_init_structure.DMA_PeripheralBaseAddr = (u32)(&USART3->DR);
+    uart3_dma_init_structure.DMA_MemoryBaseAddr = (u32)uart3_dma_tx_buf;
+    uart3_dma_init_structure.DMA_DIR = DMA_DIR_PeripheralDST;
+    uart3_dma_init_structure.DMA_BufferSize = 0;
+    uart3_dma_init_structure.DMA_PeripheralInc = DMA_PeripheralInc_Disable;
+    uart3_dma_init_structure.DMA_MemoryInc = DMA_MemoryInc_Enable;
+    uart3_dma_init_structure.DMA_PeripheralDataSize = DMA_PeripheralDataSize_Byte;
+    uart3_dma_init_structure.DMA_MemoryDataSize = DMA_MemoryDataSize_Byte;
+    uart3_dma_init_structure.DMA_Mode = DMA_Mode_Normal;
+    uart3_dma_init_structure.DMA_Priority = DMA_Priority_VeryHigh;
+    uart3_dma_init_structure.DMA_M2M = DMA_M2M_Disable;
+
+    DMA_Init(UART3_Tx_DMA_Channel, &uart3_dma_init_structure);
+
+    // DMA中断优先级
+    NVIC_InitStructure.NVIC_IRQChannel = UART3_Tx_DMA_IRQ;
+    NVIC_InitStructure.NVIC_IRQChannelPreemptionPriority = USART3_DMA_INTERRUPT_PRIORITY;
+    NVIC_InitStructure.NVIC_IRQChannelSubPriority = 0;
+    NVIC_InitStructure.NVIC_IRQChannelCmd = ENABLE;
+    NVIC_Init(&NVIC_InitStructure);
+}
+
+
+/**
+ * @brief 写入日志数据，非阻塞
+ * @note  缓冲区满了就丢弃，不能卡业务
+ */
+void drv_uart3_log_write(const u8 *data, u16 len)
+{
+    u16 i;
+    u16 next_pos;
+    u32 primask;
+
+    if (data == NULL || len == 0)
+    {
+        return;
+    }
+
+    primask = log_irq_save();
+
+    for (i = 0; i < len; i++)
+    {
+        next_pos = log_ring_next_pos(uart3_log_head);
+
+        // 环形缓冲区满了，丢弃后面的日志
+        if (next_pos == uart3_log_tail)
+        {
+            uart3_log_drop_cnt++;
+            break;
+        }
+
+        uart3_log_ring_buf[uart3_log_head] = data[i];
+        uart3_log_head = next_pos;
+    }
+
+    log_irq_restore(primask);
+
+    // 如果DMA空闲，就启动发送
+    drv_uart3_log_dma_start_next();
+}
+
+
+/**
+ * @brief 写入单个字符，给printf重定向用
+ */
+void drv_uart3_log_putchar(char ch)
+{
+    drv_uart3_log_write((u8 *)&ch, 1);
+}
+
+
+/**
+ * @brief 获取日志丢弃次数
+ */
+u32 drv_uart3_log_get_drop_count(void)
+{
+    return uart3_log_drop_cnt;
+}
+```
+
+---
+
+# 5. DMA1_Channel2_IRQHandler 改成这样
+
+你现在原来的 DMA 中断是：
+
+```c id="s6n8kx"
+void DMA1_Channel2_IRQHandler(void) {
+  DMA_ClearFlag(USRT3_Tx_DMA_FLAG);
+  DMA_Cmd(UART3_Tx_DMA_Channel,DISABLE);
+  dma_send_info.dma_send_finish_flag = true;
+}
+```
+
+如果改成异步日志 DMA，建议改成：
+
+```c id="97ryxy"
+void DMA1_Channel2_IRQHandler(void)
+{
+    if (DMA_GetITStatus(DMA1_IT_TC2) != RESET)
+    {
+        // 清除DMA发送完成中断标志
+        DMA_ClearITPendingBit(DMA1_IT_TC2);
+
+        // 清除通道全局标志
+        DMA_ClearFlag(USRT3_Tx_DMA_FLAG);
+
+        // 关闭DMA通道
+        DMA_Cmd(UART3_Tx_DMA_Channel, DISABLE);
+
+        // 关闭USART3 DMA发送请求
+        // 注意：这不会停止USART本身发送最后一个字节
+        USART_DMACmd(USART3, USART_DMAReq_Tx, DISABLE);
+
+        // 标记DMA空闲
+        uart3_dma_busy = 0;
+
+        // 如果环形缓冲区里还有数据，继续启动下一次DMA
+        drv_uart3_log_dma_start_next();
+    }
+}
+```
+
+但是这里有个问题：
+`uart3_dma_busy` 和 `drv_uart3_log_dma_start_next()` 如果是 `static`，DMA 中断函数访问不到。
+
+所以你可以有两种处理方式。
+
+---
+
+## 方式 A：把 DMA 中断函数也放进同一个 `.c` 文件
+
+也就是把：
+
+```c id="1djcl8"
+void DMA1_Channel2_IRQHandler(void)
+```
+
+放在 `drv_uart3_log_dma.c` 里面。
+
+这样它可以访问 `static` 变量。
+
+---
+
+## 方式 B：提供一个 DMA 完成回调函数
+
+在 `drv_uart3_log_dma.c` 里加：
+
+```c id="vddz8v"
+void drv_uart3_log_dma_irq_handler(void)
+{
+    if (DMA_GetITStatus(DMA1_IT_TC2) != RESET)
+    {
+        DMA_ClearITPendingBit(DMA1_IT_TC2);
+        DMA_ClearFlag(USRT3_Tx_DMA_FLAG);
+
+        DMA_Cmd(UART3_Tx_DMA_Channel, DISABLE);
+        USART_DMACmd(USART3, USART_DMAReq_Tx, DISABLE);
+
+        uart3_dma_busy = 0;
+
+        drv_uart3_log_dma_start_next();
+    }
+}
+```
+
+头文件声明：
+
+```c id="7a14jl"
+void drv_uart3_log_dma_irq_handler(void);
+```
+
+然后你的 `mh210x_it.c` 里写：
+
+```c id="lfzex4"
+void DMA1_Channel2_IRQHandler(void)
+{
+    drv_uart3_log_dma_irq_handler();
+}
+```
+
+这个更干净。
+
+---
+
+# 6. printf 重定向改成 DMA 异步
+
+你原来是：
+
+```c id="y6mcm5"
+int fputc(int ch, FILE *f)
+{
+#ifdef DEBUG_LOG
+    log_transmit_byte(ch);
+#endif
+    return ch;
+}
+```
+
+改成：
+
+```c id="dwvvbv"
+int fputc(int ch, FILE *f)
+{
+#ifdef DEBUG_LOG
+    drv_uart3_log_putchar((char)ch);
+#endif
+
+    return ch;
+}
+```
+
+这样 `printf()` 不会再一个字节一个字节死等 `TC`。
+
+---
+
+# 7. 初始化顺序要注意
+
+你系统初始化里要这样：
+
+```c id="80i74w"
+void system_init(void)
+{
+    // GPIO初始化
+    // 时钟初始化
+    // 其他外设初始化
+
+    drv_uart3_init(115200);
+
+    // USART3初始化完成后，再初始化日志DMA
+    drv_uart3_log_dma_init();
+
+    printf("system init ok\r\n");
+}
+```
+
+注意：
+
+```c id="y2vixa"
+drv_uart3_log_dma_init();
+```
+
+必须在：
+
+```c id="lb1lq7"
+drv_uart3_init(115200);
+```
+
+后面。
+
+---
+
+# 8. 但是：不要在 SysTick 里 printf
+
+即使用 DMA，也不建议你在这里打印：
+
+```c id="3kl9db"
+void SysTick_Handler(void)
+{
+    drv_display_state();
+    drv_display_wifi();
+}
+```
+
+因为 `printf()` 本身会做格式化：
+
+```c id="8p2ca0"
+%d
+字符串拼接
+除法
+取模
+访问RTC结构体
+```
+
+这些都比较耗时。
+
+所以原则还是：
+
+```c id="dxc5cd"
+中断里不要 printf
+中断里不要 sprintf
+中断里不要 vsnprintf
+```
+
+DMA 只能解决“串口发送阻塞”的问题，不能解决“格式化字符串耗时”的问题。
+
+你的 `drv_display_state()` 和 `drv_display_wifi()` 还是应该从 `SysTick_Handler()` 里拿出来。
+
+---
+
+# 9. 显示函数里的打印应该这样处理
+
+不要放在 `drv_display_state()` 每次调用末尾：
+
+```c id="k8nwm3"
+printf("[%d/%d/%d-%d:%d:%d]:led_state:%d\r\n", ...);
+```
+
+改成状态变化才打印：
+
+```c id="c9w8vd"
+void display_log_report(void)
+{
+    static u8 last_led_state = 0xff;
+    static u8 last_led_wifi = 0xff;
+
+    if (last_led_state != led_state)
+    {
+        last_led_state = led_state;
+
+        printf("[%d/%d/%d-%d:%d:%d]:led_state:%d\r\n",
+               g_rtc_time.syear,
+               g_rtc_time.smon,
+               g_rtc_time.sday,
+               g_rtc_time.hour,
+               g_rtc_time.min,
+               g_rtc_time.sec,
+               led_state);
+    }
+
+    if (last_led_wifi != led_wifi)
+    {
+        last_led_wifi = led_wifi;
+
+        printf("[%d/%d/%d-%d:%d:%d]:led_wifi:%d\r\n",
+               g_rtc_time.syear,
+               g_rtc_time.smon,
+               g_rtc_time.sday,
+               g_rtc_time.hour,
+               g_rtc_time.min,
+               g_rtc_time.sec,
+               led_wifi);
+    }
+}
+```
+
+然后主循环里调用：
+
+```c id="7b2cof"
+while (1)
+{
+    if (mode.state_led_cycle)
+    {
+        mode.state_led_cycle = 0;
+
+        drv_display_state();
+        drv_display_wifi();
+    }
+
+    display_log_report();
+}
+```
+
+---
+
+# 10. 如果你想 1 秒打印一次，也可以
+
+```c id="5921ig"
+void display_log_report_1s(void)
+{
+    static u32 last_log_time = 0;
+
+    if (timer_elapsed_ms(last_log_time) < 1000)
+    {
+        return;
+    }
+
+    last_log_time = mode.sys_time_ms;
+
+    printf("[%d/%d/%d-%d:%d:%d]:led_state:%d, led_wifi:%d, drop:%lu\r\n",
+           g_rtc_time.syear,
+           g_rtc_time.smon,
+           g_rtc_time.sday,
+           g_rtc_time.hour,
+           g_rtc_time.min,
+           g_rtc_time.sec,
+           led_state,
+           led_wifi,
+           drv_uart3_log_get_drop_count());
+}
+```
+
+这样你还能看到日志是否被丢弃：
+
+```c id="szm6hl"
+drop:%lu
+```
+
+如果 `drop` 一直增加，说明日志太多，需要降低打印频率或者增大缓冲区。
+
+---
+
+# 11. 你原来的 DMA 发送函数有个问题
+
+你现在这个：
+
+```c id="shq42k"
+void drv_uart3_dma_send_string(u8 *buff, u32 strLen) {
+  dma_send_info.dma_send_finish_flag = false;
+  DMA_InitStructure.DMA_BufferSize = strLen;
+  DMA_Init(UART3_Tx_DMA_Channel, &DMA_InitStructure);
+  DMA_Cmd(UART3_Tx_DMA_Channel,ENABLE);
+  DMA_ITConfig(UART3_Tx_DMA_Channel,DMA_IT_TC,ENABLE);
+  USART_DMACmd(USART3, USART_DMAReq_Tx, ENABLE);
+}
+```
+
+参数 `buff` 没真正用上。
+
+你的 DMA 内存地址在初始化时写死了：
+
+```c id="4vxxuf"
+DMA_InitStructure.DMA_MemoryBaseAddr = (u32)dma_send_info.tx_buf;
+```
+
+所以这个函数传进来的 `buff` 实际没改变 DMA 源地址。
+
+如果你保留这个函数，至少应该改成：
+
+```c id="onfdju"
+void drv_uart3_dma_send_string(u8 *buff, u32 strLen)
+{
+    if (buff == NULL || strLen == 0)
+    {
+        return;
+    }
+
+    dma_send_info.dma_send_finish_flag = false;
+
+    DMA_Cmd(UART3_Tx_DMA_Channel, DISABLE);
+    DMA_ClearFlag(USRT3_Tx_DMA_FLAG);
+
+    DMA_InitStructure.DMA_MemoryBaseAddr = (u32)buff;
+    DMA_InitStructure.DMA_BufferSize = strLen;
+
+    DMA_Init(UART3_Tx_DMA_Channel, &DMA_InitStructure);
+
+    DMA_ITConfig(UART3_Tx_DMA_Channel, DMA_IT_TC, ENABLE);
+    USART_DMACmd(USART3, USART_DMAReq_Tx, ENABLE);
+    DMA_Cmd(UART3_Tx_DMA_Channel, ENABLE);
+}
+```
+
+但是我更建议你别用这个单次发送函数做日志。
+日志更适合 **环形缓冲区 + DMA 自动续传**。
+
+---
+
+# 12. 最终建议
+
+你可以这样分层：
+
+```c id="9hbves"
+printf()
+  ↓
+fputc()
+  ↓
+drv_uart3_log_putchar()
+  ↓
+日志环形缓冲区
+  ↓
+DMA空闲则启动DMA
+  ↓
+DMA完成中断继续发送下一段
+```
+
+同时：
+
+```c id="gw77lr"
+SysTick_Handler 里不打印
+drv_display_state 里不频繁打印
+drv_display_wifi 里不频繁打印
+只在状态变化或者1秒一次打印
+```
+
+这样改完以后，你就能做到：
+
+```text id="tiz6eb"
+打印很多日志时，系统不会卡死；
+日志发送靠DMA后台搬运；
+日志太多时只丢日志，不影响电机、按键、传感器、状态机。
+```
+
+最关键一句：
+
+```c id="k5egos"
+DMA异步打印可以用，但它不是让你在高频中断里随便printf。
+```
+
+正确方案是：
+
+```c id="grubtr"
+中断只置标志；
+主循环限频printf；
+printf进入DMA日志缓冲区；
+DMA后台发送。
+```
