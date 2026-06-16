@@ -93,12 +93,17 @@ void uart_dma_init(void)
 void uart_dma_send(uint8_t *data, uint16_t len)
 {
     if (len == 0) return;
+    
+    /*
+    如果 DMA 正在传输，你强制关闭了通道，中断就不会触发，dma_tx_busy 永远不会被清 0，
+    程序会直接死卡在 while 循环里。
+    正确顺序必须是：先等空闲 → 再关通道 → 再改寄存器 → 再开通道。
+    */
+    // 等待DMA空闲（双重保险）
+    while (dma_tx_busy);
 
     // 1. 先关闭DMA通道，才能修改寄存器
     DMA_Cmd(UART3_TX_DMA_TX_CH, DISABLE);
-
-    // 等待DMA空闲（双重保险）
-    while (dma_tx_busy);
 
     // 2. 拷贝数据（用memcpy比循环更快）
     memcpy(dma_buf, data, len);
@@ -116,7 +121,7 @@ void uart_dma_start(void)
     // DMA忙的时候直接返回，不重复启动
     if (dma_tx_busy) return;
 
-    uint16_t len = ring_buf_len(&uart_ring_buf);
+    uint32_t len = ring_buf_len(&uart_ring_buf);
     if (len == 0 || dma_tx_busy) return;
 
     if (len > sizeof(dma_buf)) len = sizeof(dma_buf);
@@ -130,15 +135,17 @@ void DMA1_Channel2_IRQHandler(void)
 {
     if (DMA_GetITStatus(DMA1_IT_TC2))
     {
-        // 先清中断标志，防止重复进入
+        // 1. 先清中断标志和事件标志
         DMA_ClearITPendingBit(DMA1_IT_TC2);
-
-        // 关闭DMA通道
         DMA_ClearFlag(DMA1_IT_TC2);
 
-        // 清除忙标志
+        // 2. 主动关闭DMA通道，彻底停止本次传输
+        DMA_Cmd(UART3_TX_DMA_TX_CH, DISABLE);
+
+        //3. 清除忙标志
         dma_tx_busy = 0;
 
+        // 4. 续传缓冲区剩余数据
         uart_dma_start();
     }
 }
