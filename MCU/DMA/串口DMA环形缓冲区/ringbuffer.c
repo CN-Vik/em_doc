@@ -86,10 +86,10 @@ int ring_buf_pop(ringbuffer_t *ring_buf, uint8_t *data)
 
 
 /**
- * @brief 将n个Byte数据从环形缓冲区取出来
+ * @brief 将n个Byte数据从环形缓冲区取出来放入data_buf里
  * 
- * @param ring_buf 环形缓冲区地址
- * @param data 数据地址
+ * @param ring_buf 环形缓冲区地址 
+ * @param data 数据地址 
  * @param len 数据长度(单位:Byte)
  * @return int 
  */
@@ -97,11 +97,19 @@ int ring_buf_pop_n(ringbuffer_t *ring_buf, uint8_t *data, uint32_t len)
 {
     if (ring_buf_len(ring_buf) < len) return -1;
 
-    for (uint32_t i = 0; i < len; i++)
-    {
-        data[i] = ring_buf->buf[ring_buf->tail % RB_SIZE];
-        ring_buf->tail++;
+    uint32_t tail = ring_buf->tail & (RB_SIZE - 1);
+    uint32_t first_len = RB_SIZE - tail;
+
+    if (len <= first_len) {
+        // 数据不跨缓冲区末尾，一次拷完
+        memcpy(data, &ring_buf->buf[tail], len);
+    } else {
+        // 数据跨末尾，分两段拷
+        memcpy(data, &ring_buf->buf[tail], first_len);
+        memcpy(data + first_len, ring_buf->buf, len - first_len);
     }
+
+    ring_buf->tail += len;
     return 0;
 }
 

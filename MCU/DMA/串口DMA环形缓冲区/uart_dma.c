@@ -10,6 +10,7 @@
  */
 #include "uart_dma.h"
 #include "ringbuffer.h"
+#include <string.h>
 
 static volatile uint8_t dma_tx_busy = 0;
 static uint8_t dma_buf[UART_DMA_TX_BUF_SIZE];
@@ -90,7 +91,7 @@ void uart_dma_init(void)
     NVIC_EnableIRQ(DMA1_Channel2_IRQn);
 }
 
-void uart_dma_send(uint8_t *data, uint16_t len)
+void uart_dma_send(uint8_t *data, uint32_t len)
 {
     if (len == 0) return;
     
@@ -100,15 +101,14 @@ void uart_dma_send(uint8_t *data, uint16_t len)
     正确顺序必须是：先等空闲 → 再关通道 → 再改寄存器 → 再开通道。
     */
     // 等待DMA空闲（双重保险）
-    while (dma_tx_busy);
-
+    // while (dma_tx_busy);
     // 1. 先关闭DMA通道，才能修改寄存器
     DMA_Cmd(UART3_TX_DMA_TX_CH, DISABLE);
 
-    // 2. 拷贝数据（用memcpy比循环更快）
-    memcpy(dma_buf, data, len);
-
     // 3. 设置传输长度（通道关闭时写入才有效）
+    // 【关键】直接用传入的地址，不要再拷到dma_buf
+    // 因为我们已经在 uart_dma_start 里把数据拷进 dma_buf 了
+    UART3_TX_DMA_TX_CH->CMAR = (uint32_t)data; // 直接设置内存地址
     UART3_TX_DMA_TX_CH->CNDTR = len;
 
     // 4. 标记忙，再开启DMA启动传输
@@ -126,9 +126,10 @@ void uart_dma_start(void)
 
     if (len > sizeof(dma_buf)) len = sizeof(dma_buf);
 
+    /*把数据从环形缓冲区搬运到dma buf里去*/
     ring_buf_pop_n(&uart_ring_buf, dma_buf, len);
 
-    uart_dma_send(dma_buf, len);
+    uart_dma_send(dma_buf,len);
 }
 
 void DMA1_Channel2_IRQHandler(void)
@@ -138,7 +139,7 @@ void DMA1_Channel2_IRQHandler(void)
         // 1. 先清中断标志和事件标志
         DMA_ClearITPendingBit(DMA1_IT_TC2);
         DMA_ClearFlag(DMA1_IT_TC2);
-
+        memset(dma_buf, 0, sizeof(dma_buf));/*清空发送数据buf*/
         // 2. 主动关闭DMA通道，彻底停止本次传输
         DMA_Cmd(UART3_TX_DMA_TX_CH, DISABLE);
 
