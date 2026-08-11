@@ -486,8 +486,7 @@ Iq:
 
 $$
 \theta_{predict}
-================
-
+=
 \theta_{enc}
 +
 \omega t
@@ -1540,7 +1539,7 @@ $$
 
 $$
 \theta_{predict}
-================
+=
 
 \theta_{AS5600}
 +
