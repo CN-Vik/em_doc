@@ -917,3 +917,238 @@ ADC在PWM中心同步采样
 **我会选这一套。**
 
 如果你后面追求的是**极致性能**，再进一步考虑 **DPWM（不连续PWM）**，它能进一步减少开关次数、降低开关损耗，但代价是谐波、共模电压等方面发生变化。对于你目前的小功率 12V 电机，**没必要优先搞 DPWM/五段式**。
+
+
+
+
+------------------
+----------------
+----------------
+
+# SVPWM具体实现流程
+
+
+不是。**这里非常容易把“电压”和“电流”搞混。**
+
+你贴的这套**经典 SVPWM**计算：
+
+> **输入的是 FOC 控制器算出来的目标电压 (U_\alpha,U_\beta)，不是实际三相电流 Clarke 变换后的 (I_\alpha,I_\beta)。**
+
+完整链路应该是：
+
+```text
+                ┌──────────────┐
+实际三相电流 ──→│ Clarke       │
+ Ia Ib Ic       └──────┬───────┘
+                       ↓
+                   Iα、Iβ
+                       ↓
+                    Park
+                       ↓
+                   Id、Iq
+                       ↓
+                 电流 PI 控制器
+                       ↓
+                 Ud、Uq
+                       ↓
+               反 Park 变换
+                       ↓
+                 Uα、Uβ  ← ★ SVPWM输入
+                       ↓
+              ┌────────────────┐
+              │    SVPWM       │
+              │ 扇区/T1/T2/T0  │
+              └───────┬────────┘
+                      ↓
+                  Duty A/B/C
+                      ↓
+                   三相逆变器
+                      ↓
+                    电机
+```
+
+所以要严格区分：
+
+### 电流 Clarke
+
+你测：
+
+$$
+I_a,I_b,I_c
+$$
+
+得到：
+
+$$
+I_\alpha,I_\beta
+$$
+
+这是**反馈量**。
+
+---
+
+### 电压反 Park
+
+电流环 PI 输出：
+
+$$
+U_d,U_q
+$$
+
+然后根据电角度：
+
+$$
+\theta_e
+$$
+
+做反 Park：
+
+$$
+U_\alpha=U_d\cos\theta_e-U_q\sin\theta_e
+$$
+
+$$
+U_\beta=U_d\sin\theta_e+U_q\cos\theta_e
+$$
+
+这个：
+
+$$
+\boxed{U_\alpha,U_\beta}
+$$
+
+才是**SVPWM的输入**。
+
+---
+
+## 你可以这样记
+
+FOC里面有两套完全不同的 αβ：
+
+| 变换     | 输入                 | 输出                 | 用途         |
+| ------ | ------------------ | ------------------ | ---------- |
+| Clarke | (I_a,I_b,I_c)      | (I_\alpha,I_\beta) | **测电流**    |
+| Park   | (I_\alpha,I_\beta) | (I_d,I_q)          | **电流解耦**   |
+| 反 Park | (U_d,U_q)          | (U_\alpha,U_\beta) | **生成电压指令** |
+| SVPWM  | (U_\alpha,U_\beta) | Duty A/B/C         | **驱动逆变器**  |
+
+所以你刚才那个理解：
+
+> “三相实际电流 → Clarke → (U_\alpha,U_\beta) → SVPWM”
+
+是不对的。
+
+应该是：
+
+> **三相实际电流 → Clarke → (I_\alpha,I_\beta) → Park → (I_d,I_q) → PI → (U_d,U_q) → 反Park → (U_\alpha,U_\beta) → SVPWM**
+
+---
+
+### 举个你现在 FOC 的实际例子
+
+假设你电流环算出来：
+
+$$
+I_q^*=0.3A
+$$
+
+实际测量：
+
+$$
+I_d=0.02A
+$$
+
+$$
+I_q=0.25A
+$$
+
+PI 根据误差：
+
+$$
+I_q^*-I_q=0.05A
+$$
+
+计算出：
+
+$$
+U_d=0.1V
+$$
+
+$$
+U_q=2.5V
+$$
+
+然后反 Park，假设：
+
+$$
+\theta_e=60^\circ
+$$
+
+得到：
+
+$$
+U_\alpha
+$$
+
+$$
+U_\beta
+$$
+
+然后：
+
+```text
+Uα/Uβ
+  ↓
+判断在哪个60°扇区
+  ↓
+算 T1
+  ↓
+算 T2
+  ↓
+算 T0
+  ↓
+Ta/Tb/Tc
+  ↓
+PWM
+```
+
+**所以 SVPWM 根本不关心“实际电流是多少”。**
+
+它只负责一个事情：
+
+> **把 FOC 告诉它的“目标电压矢量 (U_\alpha,U_\beta)”变成三相 PWM。**
+
+而实际电流是给**电流环 PI**做反馈的。
+
+---
+
+你现在如果是在自己写 FOC，我建议把整个程序结构牢牢记成这一条：
+
+$$
+\boxed{
+I_{abc}
+\rightarrow
+Clarke
+\rightarrow
+I_{\alpha\beta}
+\rightarrow
+Park
+\rightarrow
+I_{dq}
+\rightarrow
+PI
+\rightarrow
+U_{dq}
+\rightarrow
+InvPark
+\rightarrow
+U_{\alpha\beta}
+\rightarrow
+SVPWM
+\rightarrow
+PWM
+}
+$$
+
+这条链路弄清楚以后，**你前面那套“经典 SVPWM 扇区 + T1/T2/T0”的代码就很好理解了：它处在 FOC 最后一级，处理的是“电压指令”，不是电流反馈。**
+
