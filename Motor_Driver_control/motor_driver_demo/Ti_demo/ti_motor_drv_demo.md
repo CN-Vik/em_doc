@@ -4348,3 +4348,646 @@ Universal Motor Control Lab
 尤其是你看到的 **`hall + encoder + esmo + isbldc`**，这几个目录和你要求的 **Hall 有感、AS5600 有感、无感 FOC、无感六步**几乎是一一对应的。真正需要你自己补的核心东西，反而主要是 **AS5600 I²C 驱动 + 你自己48V硬件的 `src_board` 适配 + 最终模式切换逻辑**。
 
 
+
+
+
+-------------
+-------------
+
+# DRV8353S MOS驱动芯片为啥还有软件驱动？
+对，**DRV8353 本质上就是三相 MOSFET 栅极驱动器（Gate Driver）**，不是 MCU，也不是 FOC 算法芯片。
+
+你这里看到的 `drv8353s.c` 里的“驱动程序”，其实是另一个概念：
+
+> **硬件上的 Gate Driver + MCU 侧的软件 Driver。**
+
+这两个“Driver”不是一回事。
+
+---
+
+## 1. 先把整个东西分开
+
+你现在这个 TI 工程大概是：
+
+```text
+                    C2000 MCU
+                       │
+              FOC算法 / SVPWM
+                       │
+               PWM1~PWM6
+                       │
+                       ▼
+              ┌────────────────┐
+              │    DRV8353     │
+              │  Gate Driver   │
+              └───────┬────────┘
+                      │
+              HO/LO × 3
+                      │
+                      ▼
+             ┌─────────────────┐
+             │ 6个 MOSFET      │
+             │ 三相半桥        │
+             └───────┬─────────┘
+                     │
+                     ▼
+                   电机
+```
+
+所以：
+
+### DRV8353 硬件
+
+负责：
+
+```text
+MCU PWM
+   ↓
+DRV8353
+   ↓
+MOSFET Gate
+```
+
+它主要干：
+
+* 高低侧 MOS 栅极驱动
+* 高侧浮地驱动
+* 死区
+* Gate source/sink current
+* VDS 过流保护
+* UVLO
+* Fault
+* SPI 配置
+* MOSFET 开关控制相关保护
+
+---
+
+# 2. 那 `drv8353s.c` 是干嘛的？
+
+这个文件：
+
+```text
+drv8353s.c
+```
+
+不是：
+
+> “DRV8353 芯片内部的软件”。
+
+而是：
+
+> **运行在 C2000 MCU 上，用来操作 DRV8353 的软件驱动。**
+
+这和你 ESP32 里面写：
+
+```c
+AS5600_ReadAngle();
+INA240_ReadCurrent();
+```
+
+是一个概念。
+
+例如你自己写：
+
+```text
+ESP32
+ │
+ ├── as5600.c
+ ├── ina240.c
+ └── fd6287.c
+```
+
+虽然：
+
+```text
+AS5600
+INA240
+FD6287
+```
+
+都是硬件芯片，但你 MCU 里还是需要 `.c/.h` 去操作它们。
+
+---
+
+# 3. 这个 `drv8353s.c` 最核心的其实是 SPI
+
+你贴的代码里面大量都是：
+
+```c
+DRV8353_readSPI()
+DRV8353_writeSPI()
+```
+
+这说明：
+
+> **DRV8353 本身带 SPI 配置接口。**
+
+例如：
+
+```c
+DRV8353_getDeadTime()
+```
+
+就是 MCU：
+
+```text
+C2000
+ │
+ │ SPI
+ ▼
+DRV8353
+```
+
+读取 DRV8353 的 Dead Time 配置。
+
+---
+
+# 4. 比如这段
+
+```c
+DRV8353_CTRL04_PeakSourCurLS_e 
+DRV8353_getPeakSourCurLS(DRV8353_Handle handle)
+{
+    uint16_t data;
+
+    data = DRV8353_readSPI(handle, 
+                           DRV8353_ADDRESS_CONTROL_4);
+
+    data &= DRV8353_CTRL04_IDRIVEP_LS_BITS;
+
+    return((DRV8353_CTRL04_PeakSourCurLS_e)data);
+}
+```
+
+实际上就是：
+
+```text
+C2000
+  │
+  │ SPI READ
+  ▼
+DRV8353 CONTROL REGISTER 4
+  │
+  ├── IDRIVEP_LS
+  ├── IDRIVEN_LS
+  └── TDRIVE
+```
+
+然后 MCU 把对应 bit 读出来。
+
+---
+
+# 5. `IDRIVE` 是什么？
+
+这个对于你做 MOS 驱动特别重要。
+
+比如：
+
+```c
+DRV8353_getPeakSourCurHS()
+DRV8353_getPeakSinkCurHS()
+DRV8353_getPeakSourCurLS()
+DRV8353_getPeakSinkCurLS()
+```
+
+这里的：
+
+```text
+Peak Source Current
+Peak Sink Current
+```
+
+本质就是：
+
+> **DRV8353 给 MOSFET Gate 充电/放电的峰值电流。**
+
+比如：
+
+```text
+DRV8353
+       │
+       │ 1A source
+       ▼
+MOS Gate
+       │
+       └── Gate 电容
+```
+
+打开 MOS：
+
+```text
+DRV8353
+   │
+   └── 给 Gate 充电
+```
+
+关闭 MOS：
+
+```text
+Gate
+ │
+ └── DRV8353 快速放电
+```
+
+所以 `IDRIVE` 会影响：
+
+* MOSFET 开关速度
+* 开关损耗
+* EMI
+* ringing
+* shoot-through 风险
+
+---
+
+# 6. `TDRIVE` 又是什么？
+
+你代码里面：
+
+```c
+DRV8353_getPeakSourTime()
+```
+
+实际对应：
+
+```text
+TDRIVE
+```
+
+也是 Gate 驱动相关参数。
+
+简单理解：
+
+```text
+PWM
+ │
+ ▼
+DRV8353
+ │
+ ├── Gate source current
+ ├── Gate sink current
+ └── TDRIVE
+       │
+       ▼
+     MOSFET
+```
+
+---
+
+# 7. `DEAD_TIME` 也是 DRV8353 可以配置的东西
+
+你这里：
+
+```c
+DRV8353_getDeadTime()
+```
+
+读取：
+
+```text
+CONTROL_5
+```
+
+里面的：
+
+```text
+DEAD_TIME
+```
+
+这就和你之前研究的：
+
+> **PWM 互补输出 + 死区**
+
+直接相关。
+
+例如一个半桥：
+
+```text
+       VBUS
+         │
+      ┌──┴──┐
+      │ High│
+      │ MOS │
+      └──┬──┘
+         │──── Phase U
+      ┌──┴──┐
+      │ Low │
+      │ MOS │
+      └──┬──┘
+         │
+        GND
+```
+
+不能：
+
+```text
+High ON
+Low  ON
+```
+
+同时发生。
+
+否则：
+
+```text
+VBUS
+ │
+High MOS
+ │
+Low MOS
+ │
+GND
+```
+
+直接形成 shoot-through。
+
+所以：
+
+```text
+High OFF
+      ↓
+    dead time
+      ↓
+Low ON
+```
+
+---
+
+# 8. 但是这里有一个非常容易误解的地方
+
+**DRV8353 的软件 Driver ≠ PWM Driver。**
+
+比如你看到：
+
+```c
+DRV8353_writeSPI()
+```
+
+它不是在做：
+
+```text
+PWM 20kHz
+```
+
+也不是：
+
+```text
+SVPWM
+```
+
+更不是：
+
+```text
+FOC
+```
+
+它只是：
+
+> **通过 SPI 配置 DRV8353 芯片内部寄存器。**
+
+真正的高速 PWM 还是：
+
+```text
+C2000 ePWM
+      │
+      ├── PWM1
+      ├── PWM2
+      ├── PWM3
+      ├── PWM4
+      ├── PWM5
+      └── PWM6
+             │
+             ▼
+          DRV8353
+             │
+             ▼
+          MOSFET
+```
+
+---
+
+# 9. 这也是 TI 工程架构很值得你研究的地方
+
+你现在如果看 TI 的 MotorControl SDK，经常会看到：
+
+```text
+drv8353s.c
+drv8353s.h
+```
+
+你千万不要以为：
+
+```text
+drv8353s.c
+=
+FOC驱动
+```
+
+实际上更接近：
+
+```text
+                   C2000
+                     │
+       ┌─────────────┴──────────────┐
+       │                            │
+       ▼                            ▼
+   FOC控制软件                  DRV8353软件Driver
+       │                            │
+       │ ePWM                       │ SPI
+       ▼                            ▼
+   PWM1~6                       DRV8353寄存器
+       │                            │
+       └────────────┬───────────────┘
+                    ▼
+                 DRV8353
+                    │
+                    ▼
+               MOSFET Gate
+                    │
+                    ▼
+                 三相桥
+```
+
+---
+
+# 10. 甚至可以类比你现在的 ESP32 项目
+
+你现在做：
+
+```text
+ESP32
+ │
+ ├── FOC
+ ├── SVPWM
+ ├── MCPWM
+ │
+ ▼
+FD6287
+ │
+ ▼
+MOSFET
+```
+
+如果你给 FD6287 写一个：
+
+```text
+fd6287.c
+fd6287.h
+```
+
+这个文件就属于：
+
+> **Gate Driver 软件抽象层。**
+
+例如：
+
+```c
+FD6287_Init();
+FD6287_Enable();
+FD6287_SetDeadTime();
+```
+
+但是 FD6287 本身可能没有 SPI，所以你的软件 Driver 就很简单。
+
+而 DRV8353 更复杂，因为它有：
+
+```text
+SPI
+```
+
+所以 TI 才给它写了一大坨：
+
+```c
+DRV8353_readSPI()
+DRV8353_writeSPI()
+DRV8353_setupSPI()
+DRV8353_readData()
+DRV8353_writeData()
+```
+
+---
+
+# 11. 你贴的这个文件实际上没有做 FOC
+
+这个特别重要。
+
+你把整个 `drv8353s.c` 看完，会发现它基本都在做：
+
+```text
+初始化
+GPIO EN
+SPI
+读寄存器
+写寄存器
+读取故障
+读取 IDRIVE
+读取 DEAD_TIME
+读取 PWM MODE
+```
+
+但是你不会看到：
+
+```c
+Clarke();
+Park();
+PI();
+SVPWM();
+```
+
+因为：
+
+> **它根本不是 FOC 算法。**
+
+它只是：
+
+```text
+        DRV8353 Hardware Abstraction
+                     │
+                     ▼
+                SPI Register
+                     │
+                     ▼
+                 DRV8353
+```
+
+---
+
+# 12. 那 TI 的 FOC 到底在哪里？
+
+这才是你现在真正值得继续往下扒的。
+
+TI 的工程通常会把东西拆成：
+
+```text
+Application
+    │
+    ▼
+Motor Control
+    │
+    ├── Clarke
+    ├── Park
+    ├── PI
+    ├── SVGEN
+    ├── estimator
+    ├── speed control
+    └── current control
+              │
+              ▼
+             ePWM
+              │
+              ▼
+          DRV8353
+              │
+              ▼
+            MOSFET
+```
+
+所以你现在看到的：
+
+```text
+drv8353s.c
+```
+
+其实只是**最底下的外围芯片驱动层**。
+
+---
+
+## 一句话总结
+
+你理解得没错：
+
+> **DRV8353 是硬件 MOSFET 栅极驱动器。**
+
+但是：
+
+> **`drv8353s.c` 是 C2000 MCU 上运行的“DRV8353 软件驱动”，用于通过 GPIO/SPI 去配置、读取、控制 DRV8353。**
+
+所以：
+
+```text
+硬件 Driver：
+DRV8353
+= Gate Driver
+= 给 MOSFET 推 Gate
+
+软件 Driver：
+drv8353s.c
+= C2000 操作 DRV8353 的 API
+= SPI读写寄存器
+```
+
+而真正的：
+
+```text
+FOC
+Clarke
+Park
+PI
+SVPWM
+电流环
+速度环
+```
+
+**完全是另外一层。**
+
+你现在如果是在研究 **TI C2000 的完整 FOC 架构**，下一步其实应该找的不是 `drv8353s.c`，而是这个工程里**“谁调用了 `DRV8353_enable()`、谁产生 ePWM、谁执行 Clarke/Park/SVGEN/PI”**。这几个调用链一串起来，你就能把 TI 的整个 FOC 软件架构看明白。
+
