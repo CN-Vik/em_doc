@@ -247,8 +247,7 @@ $$
 $$
 e_\theta=
 E_\alpha cos\theta
----
-
+-
 E_\beta sin\theta
 $$
 
